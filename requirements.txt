@@ -1,0 +1,2 @@
+playwright
+fbn @ git+https://github.com/viseshrp/fbn@982cc97ae3b41a6ad90167c7205c37bd82a78fbe

@@ -1,0 +1,33 @@
+{
+  "groups": [
+    {
+      "id": "1234567890",
+      "name": "Example group"
+    }
+  ],
+  "keywords": [
+    "AI automation",
+    "automat*",
+    "n8n",
+    "Make.com",
+    "Zapier",
+    "chatbot",
+    "AI agent",
+    "tự động hóa",
+    "trợ lý AI"
+  ],
+  "poll_seconds": [
+    90,
+    180
+  ],
+  "scrolls": 4,
+  "headless": true,
+  "telegram_token": "",
+  "telegram_chat_id": "",
+  "braveduck": {
+    "enabled": true,
+    "bin": "~/go/bin/braveduck",
+    "db": ""
+  },
+  "sample_count": 10
+}

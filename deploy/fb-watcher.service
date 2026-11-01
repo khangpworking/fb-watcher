@@ -1,0 +1,15 @@
+[Unit]
+Description=fb-watcher: Facebook group keyword alerts -> Telegram + braveduck
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/fb-watcher
+ExecStart=%h/fb-watcher/.venv/bin/python -u watcher.py run
+Restart=on-failure
+RestartSec=60
+# Exit 3 = logged out / account check: needs you, so don't restart into it.
+RestartPreventExitStatus=3
+
+[Install]
+WantedBy=default.target

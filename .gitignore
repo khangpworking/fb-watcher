@@ -1,0 +1,6 @@
+profile/
+seen.db
+config.json
+.venv/
+libs/
+__pycache__/
