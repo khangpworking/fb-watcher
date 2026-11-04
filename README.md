@@ -47,6 +47,7 @@ When `braveduck.enabled` is true, each matching post is also added with `bravedu
 | url | Post link (braveduck uses this to skip duplicates) |
 | jd | Post text, plus author, group and matched keywords |
 
+- After each round, fb-watcher reports scan health with `braveduck crawl-report facebook --ok` (or `--fail "<error type>: <message>"`), so the board shows when Facebook scanning is broken or logged out. Only fbn's fixed error text is sent, never post content. On a braveduck build without `crawl-report`, the call fails quietly.
 - `db` is empty by default, which uses `~/.braveduck/braveduck.db`. Set it to point at a different board.
 
 ## Notes

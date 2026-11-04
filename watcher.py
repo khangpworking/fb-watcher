@@ -152,6 +152,21 @@ def add_to_braveduck(cfg, post, group_id, group_name, hits):
         print("braveduck add failed:", out)
 
 
+def report_to_braveduck(cfg, ok, reason=""):
+    """Tell the braveduck board whether this round's scan worked (`braveduck crawl-report`)."""
+    bd = cfg.get("braveduck") or {}
+    if not bd.get("enabled"):
+        return
+    args = [os.path.expanduser(bd.get("bin", "~/go/bin/braveduck"))]
+    if bd.get("db"):
+        args += ["--db", os.path.expanduser(bd["db"])]
+    args += ["crawl-report", "facebook"] + (["--ok"] if ok else ["--fail", reason[:300]])
+    try:
+        subprocess.run(args, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # an older braveduck without crawl-report, or a hiccup, must never stop scanning
+
+
 # --- scraping (fbn's mobile reader) ----------------------------------------
 
 # Exit code for problems a restart can't fix (login, account check); the systemd unit doesn't restart on it.
@@ -241,6 +256,8 @@ def cmd_run():
     groups = [(parse_group_ref(str(g["id"])), g.get("name", str(g["id"]))) for g in cfg["groups"]]
 
     while True:
+        # Board health: ok if any group scanned this round. fbn's messages are fixed text, never post content.
+        scanned, last_error = 0, ""
         for group_ref, name in groups:
             gid = group_ref.key
             # First time we see a group, record existing posts silently instead of flooding alerts.
@@ -250,11 +267,14 @@ def cmd_run():
             except FATAL_ERRORS as e:
                 send_telegram(cfg, f"⚠️ fb-watcher stopped ({type(e).__name__}): {e}\n"
                                    "Run `python watcher.py login` (or import-cookies) again.")
+                report_to_braveduck(cfg, False, f"{type(e).__name__}: {e}")
                 raise SystemExit(EXIT_NEEDS_USER)
             except FbnError as e:
                 # Timeouts, layout drift, access problems: skip this group for one round.
                 print(f"[{name}] {type(e).__name__}: {e} (will retry next round)")
+                last_error = f"{type(e).__name__}: {e}"
                 continue
+            scanned += 1
 
             new = 0
             for post in posts:
@@ -277,6 +297,7 @@ def cmd_run():
             print(f"[{time.strftime('%H:%M:%S')}] [{name}] {len(posts)} posts, {new} new"
                   + (" (bootstrap, no alerts)" if bootstrap else ""))
             time.sleep(random.randint(3, 8))
+        report_to_braveduck(cfg, scanned > 0, last_error)
         time.sleep(random.randint(lo, hi))
 
 
