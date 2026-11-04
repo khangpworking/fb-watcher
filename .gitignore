@@ -1,6 +1,10 @@
+.login-done
+.profile.lock
+.venv/
+__pycache__/
+config.json
+failure-screenshots/
+libs/
+login-shots/
 profile/
 seen.db
-config.json
-.venv/
-libs/
-__pycache__/

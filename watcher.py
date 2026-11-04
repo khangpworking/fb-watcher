@@ -31,6 +31,7 @@ LOCAL_LIBS = ROOT / "libs" / "root" / "usr" / "lib" / "x86_64-linux-gnu"
 if LOCAL_LIBS.is_dir():
     os.environ["LD_LIBRARY_PATH"] = f"{LOCAL_LIBS}:{os.environ.get('LD_LIBRARY_PATH', '')}"
 
+import fbn_patch  # noqa: E402,F401  (skip unreadable posts instead of failing the scan)
 from fbn.auth import load_facebook_cookies  # noqa: E402
 from fbn.config import BrowserSettings  # noqa: E402
 from fbn.exceptions import (  # noqa: E402
@@ -184,10 +185,41 @@ def scrape_group(source, db, group_ref, policy):
     ]
 
 
+LOGIN_DONE_FILE = ROOT / ".login-done"
+
+
+def wait_for_login():
+    if sys.stdin.isatty():
+        input("Press Enter once you are logged in... ")
+        return
+    # No terminal (e.g. started by another tool): wait for `touch .login-done` instead.
+    print(f"Waiting for {LOGIN_DONE_FILE} to appear...", flush=True)
+    while not LOGIN_DONE_FILE.exists():
+        time.sleep(1)
+    LOGIN_DONE_FILE.unlink()
+
+
 def cmd_login():
-    print("Log in to Facebook in the browser window, then come back here.")
-    make_source(headless=False).interactive_login(lambda: input("Press Enter once you are logged in... "))
-    print("Login verified and saved to", PROFILE_DIR)
+    """Log in with a normal desktop window; fbn's mobile reader reuses the same profile's cookies."""
+    from playwright.sync_api import sync_playwright
+
+    print("Log in to Facebook in the browser window, then come back here.", flush=True)
+    LOGIN_DONE_FILE.unlink(missing_ok=True)
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(
+            # WSLg ignores --start-maximized, so ask for an explicit window size.
+            str(PROFILE_DIR), headless=False, viewport={"width": 1280, "height": 860},
+            args=["--window-size=1300,980", "--window-position=40,20"],
+        )
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto("https://www.facebook.com/")
+        wait_for_login()
+        logged_in = any(c["name"] == "c_user" for c in ctx.cookies("https://www.facebook.com"))
+        ctx.close()
+    if not logged_in:
+        print("Not logged in yet (no Facebook session cookie). Run login again.")
+        raise SystemExit(EXIT_NEEDS_USER)
+    print("Login saved to", PROFILE_DIR)
 
 
 def cmd_import_cookies(cookie_file):
