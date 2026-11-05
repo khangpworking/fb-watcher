@@ -47,7 +47,7 @@ When `braveduck.enabled` is true, each matching post is also added with `bravedu
 | url | Post link (braveduck uses this to skip duplicates) |
 | jd | Post text, plus author, group and matched keywords |
 
-- After each round, fb-watcher reports scan health with `braveduck crawl-report facebook --ok` (or `--fail "<error type>: <message>"`), so the board shows when Facebook scanning is broken or logged out. Only fbn's fixed error text is sent, never post content. On a braveduck build without `crawl-report`, the call fails quietly.
+- After each round, fb-watcher reports scan health with `braveduck crawl-report facebook --ok` (or `--fail "<error type>: <message>"`), so the board shows when Facebook scanning is broken or logged out. If any one group fails 3 rounds in a row, it reports `--fail "<error type> on <group> since HH:MM"` even while other groups work. Only fbn's fixed error text is sent, never post content. On a braveduck build without `crawl-report`, the call fails quietly.
 - `db` is empty by default, which uses `~/.braveduck/braveduck.db`. Set it to point at a different board.
 
 ## Notes
@@ -56,7 +56,7 @@ When `braveduck.enabled` is true, each matching post is also added with `bravedu
 - Scraping breaks Facebook's ToS. Use a secondary account that has joined the groups, and keep `poll_seconds` at 60 or higher.
 - Each scan scrolls back until it reaches the newest post from the previous scan (the `boundary` table), up to `scrolls` scrolls and `sample_count` posts. If more than `sample_count` posts arrive between two scans, the oldest ones are missed; raise `sample_count` (maximum 50) for busy groups.
 - If you're logged out, Facebook asks for an account action, or the browser can't start, the watcher sends a Telegram warning and exits. Timeouts, page-layout changes and access errors only skip that group for the current round.
-- `fbn_patch.py` makes fbn skip a post it can't fully read, such as a shared post or one with a "Follow" button next to the author, instead of failing the whole group. If the patch no longer fits a new fbn version, the watcher stops at startup with a clear error.
+- `fbn_patch.py` makes fbn skip a post it can't fully read, such as a shared post or one with a "Follow" button next to the author, instead of failing the whole group. If the patch no longer fits a new fbn version, the watcher stops at startup with a clear error. It also keeps a post whose own page fbn can't read (fbn opens each post to check its link) by using the post link Facebook's share link redirects to.
 - When Facebook changes its layout, update fbn: change the commit in `requirements.txt`, then run `.venv/bin/pip install -r requirements.txt`. If fbn fails, it saves screenshots and says where in its error message.
 
 ## Run as a service

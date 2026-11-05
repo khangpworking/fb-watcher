@@ -255,8 +255,10 @@ def cmd_run():
     policy = ScanPolicy(sample_count=cfg["sample_count"], max_scrolls=cfg["scrolls"])
     groups = [(parse_group_ref(str(g["id"])), g.get("name", str(g["id"]))) for g in cfg["groups"]]
 
+    failing = {}  # group name -> (first failure time, consecutive failed rounds, last error)
     while True:
-        # Board health: ok if any group scanned this round. fbn's messages are fixed text, never post content.
+        # Board health: ok if any group scanned this round and none has failed 3 rounds in a row.
+        # fbn's messages are fixed text, never post content.
         scanned, last_error = 0, ""
         for group_ref, name in groups:
             gid = group_ref.key
@@ -273,8 +275,11 @@ def cmd_run():
                 # Timeouts, layout drift, access problems: skip this group for one round.
                 print(f"[{name}] {type(e).__name__}: {e} (will retry next round)")
                 last_error = f"{type(e).__name__}: {e}"
+                since, rounds, _ = failing.get(name, (time.strftime("%H:%M"), 0, ""))
+                failing[name] = (since, rounds + 1, type(e).__name__)
                 continue
             scanned += 1
+            failing.pop(name, None)
 
             new = 0
             for post in posts:
@@ -297,7 +302,11 @@ def cmd_run():
             print(f"[{time.strftime('%H:%M:%S')}] [{name}] {len(posts)} posts, {new} new"
                   + (" (bootstrap, no alerts)" if bootstrap else ""))
             time.sleep(random.randint(3, 8))
-        report_to_braveduck(cfg, scanned > 0, last_error)
+        stuck = [f"{err} on {name} since {since}" for name, (since, rounds, err) in failing.items() if rounds >= 3]
+        if stuck:
+            report_to_braveduck(cfg, False, "; ".join(stuck))
+        else:
+            report_to_braveduck(cfg, scanned > 0, last_error)
         time.sleep(random.randint(lo, hi))
 
 
