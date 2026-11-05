@@ -82,7 +82,14 @@ def _timestamp_post_link(page, menu, *, timeout_seconds):
     group = mobile._group_key(source_url)
     if not group or not group.isdecimal():
         raise mobile._layout_failure("numeric_source_group")
-    stamp = page.evaluate_handle(_TIMESTAMP, menu).as_element()
+    try:
+        stamp = page.evaluate_handle(_TIMESTAMP, menu).as_element()
+    except PlaywrightError:
+        # fbn's parser only counts visible cards; after scrolling, this one may sit
+        # at the viewport edge. Bring it into view and look once more.
+        menu.scroll_into_view_if_needed(timeout=3000)
+        page.wait_for_timeout(300)
+        stamp = page.evaluate_handle(_TIMESTAMP, menu).as_element()
     if stamp is None:
         raise mobile._layout_failure("source_timestamp")
     try:
@@ -131,8 +138,10 @@ def copy_post_link(page, menu, *, timeout_seconds):
         if not restored:
             raise
         partial_scans.append(type(exc).__name__)
-        log.warning("post link step failed (%s); ending this scan with the posts read so far",
-                    type(exc).__name__)
+        # Local log only (journal); board health never gets this text.
+        detail = (str(exc).strip().splitlines() or [""])[0][:200]
+        log.warning("post link step failed (%s: %s); ending this scan with the posts read so far",
+                    type(exc).__name__, detail)
         raise mobile._ScanBudgetExpired() from exc
 
 

@@ -12,6 +12,7 @@ import json
 import os
 import random
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -33,6 +34,7 @@ if LOCAL_LIBS.is_dir():
     os.environ["LD_LIBRARY_PATH"] = f"{LOCAL_LIBS}:{os.environ.get('LD_LIBRARY_PATH', '')}"
 
 import fbn_patch  # noqa: E402,F401  (skip unreadable posts instead of failing the scan)
+from fbn import exceptions as fbn_exceptions  # noqa: E402
 from fbn.auth import load_facebook_cookies  # noqa: E402
 from fbn.config import BrowserSettings  # noqa: E402
 from fbn.exceptions import (  # noqa: E402
@@ -91,7 +93,14 @@ def open_db():
     db.execute("CREATE TABLE IF NOT EXISTS boundary (group_id TEXT PRIMARY KEY, post_id TEXT)")
     # A group is initialized after its first successful scan, even one that found no posts.
     db.execute("CREATE TABLE IF NOT EXISTS group_state (group_id TEXT PRIMARY KEY, initialized INTEGER NOT NULL)")
-    db.execute("INSERT OR IGNORE INTO group_state SELECT DISTINCT group_id, 1 FROM seen")
+    db.execute("INSERT OR IGNORE INTO group_state (group_id, initialized) SELECT DISTINCT group_id, 1 FROM seen")
+    if "incomplete" not in [row[1] for row in db.execute("PRAGMA table_info(group_state)")]:
+        # Consecutive scans that didn't reach the stored boundary.
+        db.execute("ALTER TABLE group_state ADD COLUMN incomplete INTEGER NOT NULL DEFAULT 0")
+    # Deliveries still owed for matched posts: one row per post and sink, deleted once delivered.
+    db.execute("""CREATE TABLE IF NOT EXISTS outbox (
+        post_key TEXT, sink TEXT, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+        created INTEGER NOT NULL, PRIMARY KEY (post_key, sink))""")
     db.commit()
     return db
 
@@ -101,8 +110,13 @@ def is_seen(db, key):
 
 
 def mark_seen(db, key, group_id):
+    """Record a post as handled. Callers commit, together with any outbox rows for it."""
     db.execute("INSERT OR IGNORE INTO seen VALUES (?, ?, ?)", (key, group_id, int(time.time())))
-    db.commit()
+
+
+def enqueue(db, key, sink, payload):
+    db.execute("INSERT OR IGNORE INTO outbox (post_key, sink, payload, created) VALUES (?, ?, ?, ?)",
+               (key, sink, json.dumps(payload, ensure_ascii=False), int(time.time())))
 
 
 def group_initialized(db, group_id):
@@ -110,16 +124,27 @@ def group_initialized(db, group_id):
 
 
 def mark_group_initialized(db, group_id):
-    db.execute("INSERT OR REPLACE INTO group_state VALUES (?, 1)", (group_id,))
+    db.execute("INSERT OR IGNORE INTO group_state (group_id, initialized) VALUES (?, 1)", (group_id,))
+    db.execute("UPDATE group_state SET initialized = 1 WHERE group_id = ?", (group_id,))
     db.commit()
+
+
+def bump_incomplete(db, group_id, reset=False):
+    """Count consecutive scans that didn't reach the boundary; return the new count."""
+    db.execute("INSERT OR IGNORE INTO group_state (group_id, initialized) VALUES (?, 1)", (group_id,))
+    db.execute("UPDATE group_state SET incomplete = CASE WHEN ? THEN 0 ELSE incomplete + 1 END WHERE group_id = ?",
+               (reset, group_id))
+    db.commit()
+    return db.execute("SELECT incomplete FROM group_state WHERE group_id = ?", (group_id,)).fetchone()[0]
 
 
 # --- alerts -----------------------------------------------------------------
 
 def send_telegram(cfg, text):
+    """Send a Telegram message; True if delivered (or Telegram isn't configured and it was printed)."""
     if not cfg["telegram_token"] or not cfg["telegram_chat_id"]:
         print("[alert]", text)
-        return
+        return True
     url = f"https://api.telegram.org/bot{cfg['telegram_token']}/sendMessage"
     data = urllib.parse.urlencode({
         "chat_id": cfg["telegram_chat_id"],
@@ -128,18 +153,20 @@ def send_telegram(cfg, text):
     }).encode()
     try:
         urllib.request.urlopen(url, data=data, timeout=15).read()
+        return True
     except Exception as e:
-        print("telegram send failed:", e)
+        print("telegram send failed:", type(e).__name__)
+        return False
 
 
 MAX_JD_BYTES = 100_000
 
 
 def add_to_braveduck(cfg, post, group_id, group_name, hits):
-    """Add a matched post to the braveduck job board via `braveduck add`."""
+    """Add a matched post to the braveduck job board; True if it's on the board (new or already there)."""
     bd = cfg.get("braveduck") or {}
     if not bd.get("enabled"):
-        return
+        return True
     first_line = next((line.strip() for line in post["text"].splitlines() if line.strip()), "Facebook post")
     title = first_line if len(first_line) <= 120 else first_line[:117] + "..."
     group_url = f"https://www.facebook.com/groups/{group_id}/"
@@ -163,13 +190,14 @@ def add_to_braveduck(cfg, post, group_id, group_name, hits):
     try:
         res = subprocess.run(args, capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as e:
-        print("braveduck add failed:", e)
-        return
+        print("braveduck add failed:", type(e).__name__)
+        return False
     out = (res.stdout or res.stderr).strip()
     if res.returncode == 0 or "already on the board" in out:
         print("[braveduck]", out)
-    else:
-        print("braveduck add failed:", out)
+        return True
+    print("braveduck add failed:", out[:300])
+    return False
 
 
 def report_to_braveduck(cfg, ok, reason=""):
@@ -303,16 +331,91 @@ def set_boundary(db, group_id, post_id):
     db.commit()
 
 
-def scrape_group(source, db, group_ref, policy):
-    """Return the group's recent posts, newest first, scrolling back to the last scan's newest post."""
-    scan = source.fetch_recent(group_ref, policy, boundary_post_id=get_boundary(db, group_ref.key))
+# Each scan runs in its own process group, so a hung browser can be killed with all its
+# children instead of freezing every other group (a stalled navigation can block fbn's
+# cleanup with no timeout of its own).
+SCAN_WALL_SECONDS = 240
+INCOMPLETE_ROUNDS_BEFORE_GAP = 3
+
+
+class ScanWorkerError(FbnError):
+    """The scan worker crashed, hung, or returned something unreadable."""
+
+
+def scan_in_process(account, group_ref, policy, boundary, headless=True):
+    """Scan one group; return (posts newest first, complete) where complete means the
+    scan reached `boundary` (or there was none yet)."""
+    scan = make_source(account, headless).fetch_recent(group_ref, policy, boundary_post_id=boundary)
     posts = sorted(scan.posts, key=lambda post: post.position)
-    if posts:
-        set_boundary(db, group_ref.key, posts[0].post_id)
+    complete = boundary is None or any(post.post_id == boundary for post in posts)
     return [
-        {"key": f"{group_ref.key}:{post.post_id}", "text": post.text, "url": post.url, "author": post.author or ""}
+        {"post_id": post.post_id, "key": f"{group_ref.key}:{post.post_id}", "text": post.text,
+         "url": post.url, "author": post.author or ""}
         for post in posts
-    ]
+    ], complete
+
+
+def scan_in_subprocess(account, group_ref, policy, boundary, headless=True):
+    request = {
+        "profile": str(account["profile"]), "proxy": account["proxy"], "group": group_ref.key,
+        "sample_count": policy.sample_count, "max_scrolls": policy.max_scrolls,
+        "boundary": boundary, "headless": headless,
+    }
+    worker = subprocess.Popen(
+        [sys.executable, "-u", str(ROOT / "watcher.py"), "scan-worker"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, start_new_session=True,
+    )
+    try:
+        out, _ = worker.communicate(json.dumps(request), timeout=SCAN_WALL_SECONDS)
+    except subprocess.TimeoutExpired:
+        os.killpg(worker.pid, signal.SIGKILL)  # the worker and every Chromium process it started
+        worker.wait()
+        raise ScanWorkerError(f"scan took longer than {SCAN_WALL_SECONDS}s and was stopped") from None
+    try:
+        reply = json.loads(out.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        raise ScanWorkerError(f"scan worker exited with code {worker.returncode} and no result") from None
+    if reply["ok"]:
+        return reply["posts"], reply["complete"]
+    error = getattr(fbn_exceptions, reply["error"], None)
+    if not (isinstance(error, type) and issubclass(error, FbnError)):
+        error = ScanWorkerError
+    raise error(reply["message"])
+
+
+# Tests set FB_WATCHER_INPROCESS=1 to scan with fakes in the same process.
+run_scan = scan_in_process if os.environ.get("FB_WATCHER_INPROCESS") else scan_in_subprocess
+
+
+def cmd_scan_worker():
+    """Internal: run one scan described on stdin; print one JSON line with the result."""
+    request = json.loads(sys.stdin.read())
+    account = {"profile": Path(request["profile"]), "proxy": request["proxy"]}
+    policy = ScanPolicy(sample_count=request["sample_count"], max_scrolls=request["max_scrolls"])
+    try:
+        posts, complete = scan_in_process(
+            account, parse_group_ref(request["group"]), policy, request["boundary"], request["headless"])
+        reply = {"ok": True, "posts": posts, "complete": complete}
+    except Exception as e:  # sent back to the parent, which raises it there
+        reply = {"ok": False, "error": type(e).__name__, "message": str(e)[:500]}
+    print(json.dumps(reply, ensure_ascii=False), flush=True)
+
+
+def advance_boundary(db, group_id, posts, complete):
+    """Move the boundary to the newest post only when the scan reached the old one, so a
+    gap of unread posts can't be skipped. After a few incomplete rounds in a row (the old
+    boundary post was deleted, or one post keeps cutting the scan short), move anyway and
+    return the gap size in rounds so the caller can report it."""
+    if not posts:
+        return 0
+    if complete:
+        bump_incomplete(db, group_id, reset=True)
+        set_boundary(db, group_id, posts[0]["post_id"])
+        return 0
+    rounds = bump_incomplete(db, group_id)
+    if rounds >= INCOMPLETE_ROUNDS_BEFORE_GAP:
+        set_boundary(db, group_id, posts[0]["post_id"])
+    return rounds
 
 
 LOGIN_DONE_FILE = ROOT / ".login-done"
@@ -380,31 +483,71 @@ def cmd_check_proxy(account_name=None):
     print(f"[{account['name']}] public IP {ip} ({via})")
 
 
+def deliver_pending(cfg, db):
+    """Try every owed delivery once; return (pending, failing) counts for board health.
+    `failing` counts deliveries that have already failed 3 times or more."""
+    rows = db.execute("SELECT post_key, sink, payload, attempts FROM outbox ORDER BY created").fetchall()
+    for key, sink, payload, attempts in rows:
+        item = json.loads(payload)
+        if sink == "braveduck":
+            ok = add_to_braveduck(cfg, item["post"], item["group_id"], item["group_name"], item["hits"])
+        else:
+            ok = send_telegram(cfg, item["message"])
+        if ok:
+            db.execute("DELETE FROM outbox WHERE post_key = ? AND sink = ?", (key, sink))
+        else:
+            db.execute("UPDATE outbox SET attempts = attempts + 1 WHERE post_key = ? AND sink = ?", (key, sink))
+        db.commit()
+    pending, failing = db.execute("SELECT COUNT(*), COALESCE(SUM(attempts >= 3), 0) FROM outbox").fetchone()
+    return pending, failing
+
+
+def record_posts(db, posts, group_id, group_name, bootstrap, match):
+    """Mark new posts seen and queue deliveries for matches, in one transaction per post."""
+    new = 0
+    for post in posts:
+        if is_seen(db, post["key"]):
+            continue
+        new += 1
+        with db:
+            mark_seen(db, post["key"], group_id)
+            hits = [] if bootstrap else match(post["text"])
+            if hits:
+                message = (f"🔔 [{group_name}] {post['author']}\n"
+                           f"Keywords: {', '.join(hits)}\n\n"
+                           f"{post['text'][:1500]}\n\n"
+                           f"{post['url']}")
+                enqueue(db, post["key"], "telegram", {"message": message})
+                enqueue(db, post["key"], "braveduck",
+                        {"post": post, "group_id": group_id, "group_name": group_name, "hits": hits})
+    return new
+
+
 def cmd_run():
     cfg = load_config()
     match = build_matcher(cfg["keywords"])
     db = open_db()
     lo, hi = cfg["poll_seconds"]
     policy = ScanPolicy(sample_count=cfg["sample_count"], max_scrolls=cfg["scrolls"])
+    headless = cfg.get("headless", True)
     accounts = load_accounts(cfg)
-    for account in accounts:
-        account["source"] = make_source(account, headless=cfg.get("headless", True))
 
     failing = {}  # (account, group id) -> (group name, first failure time, consecutive failed rounds, error type)
+    gaps = {}  # (account, group id) -> (group name, consecutive incomplete rounds)
     down = {}  # account name -> reason; its groups are skipped until you log it in again and restart
     while True:
-        # Board health: ok if any group scanned this round, no group has failed 3 rounds in a row
-        # and no account is logged out. fbn's messages are fixed text, never post content.
+        # Board text uses error types and our own identifiers only, never fbn's messages or post text.
         scanned, last_error = 0, ""
         for account in accounts:
             if account["name"] in down:
                 continue
             for group_ref, name in account["groups"]:
                 gid = group_ref.key
-                # First time we see a group, record existing posts silently instead of flooding alerts.
+                key = (account["name"], gid)
+                # First successful scan of a group records existing posts silently instead of flooding alerts.
                 bootstrap = not group_initialized(db, gid)
                 try:
-                    posts = scrape_group(account["source"], db, group_ref, policy)
+                    posts, complete = run_scan(account, group_ref, policy, get_boundary(db, gid), headless)
                 except FATAL_ERRORS as e:
                     down[account["name"]] = f"{type(e).__name__} on account {account['name']}"
                     send_telegram(cfg, f"⚠️ fb-watcher: account {account['name']} stopped ({type(e).__name__}): {e}\n"
@@ -413,43 +556,35 @@ def cmd_run():
                     print(f"[{account['name']}] {type(e).__name__}: {e} (account paused)")
                     break
                 except FbnError as e:
-                    # Timeouts, layout drift, access problems: skip this group for one round.
+                    # Timeouts, layout drift, access problems, a hung scan: skip this group for one round.
                     print(f"[{name}] {type(e).__name__}: {e} (will retry next round)")
-                    # Board text: error type and our own identifiers only, never fbn's message.
                     last_error = f"{type(e).__name__} on {name} ({gid})"
-                    key = (account["name"], gid)
                     _, since, rounds, _ = failing.get(key, (name, time.strftime("%H:%M"), 0, ""))
                     failing[key] = (name, since, rounds + 1, type(e).__name__)
                     continue
                 scanned += 1
-                failing.pop((account["name"], gid), None)
+                failing.pop(key, None)
+                new = record_posts(db, posts, gid, name, bootstrap, match)
                 if bootstrap:
                     mark_group_initialized(db, gid)
-
-                new = 0
-                for post in posts:
-                    if is_seen(db, post["key"]):
-                        continue
-                    mark_seen(db, post["key"], gid)
-                    new += 1
-                    if bootstrap:
-                        continue
-                    hits = match(post["text"])
-                    if hits:
-                        msg = (
-                            f"🔔 [{name}] {post['author']}\n"
-                            f"Keywords: {', '.join(hits)}\n\n"
-                            f"{post['text'][:1500]}\n\n"
-                            f"{post['url']}"
-                        )
-                        send_telegram(cfg, msg)
-                        add_to_braveduck(cfg, post, gid, name, hits)
+                incomplete = advance_boundary(db, gid, posts, complete)
+                if incomplete:
+                    gaps[key] = (name, incomplete)
+                else:
+                    gaps.pop(key, None)
                 print(f"[{time.strftime('%H:%M:%S')}] [{account['name']}/{name}] {len(posts)} posts, {new} new"
-                      + (" (bootstrap, no alerts)" if bootstrap else ""))
+                      + (" (bootstrap, no alerts)" if bootstrap else "")
+                      + (f" (didn't reach last scan's newest post, {incomplete} rounds)" if incomplete else ""))
                 time.sleep(random.randint(3, 8))
-        problems = list(down.values()) + [
-            f"{err} on {name} ({key[1]}) since {since}" for key, (name, since, rounds, err) in failing.items() if rounds >= 3
-        ]
+
+        pending, failing_deliveries = deliver_pending(cfg, db)
+        problems = list(down.values())
+        problems += [f"{err} on {name} ({k[1]}) since {since}"
+                     for k, (name, since, rounds, err) in failing.items() if rounds >= 3]
+        problems += [f"incomplete scans on {name} ({k[1]}) for {rounds} rounds"
+                     for k, (name, rounds) in gaps.items() if rounds >= INCOMPLETE_ROUNDS_BEFORE_GAP]
+        if failing_deliveries:
+            problems.append(f"{failing_deliveries} of {pending} deliveries failing")
         if len(down) == len(accounts):
             report_to_braveduck(cfg, False, "; ".join(problems))
             raise SystemExit(EXIT_NEEDS_USER)
@@ -471,6 +606,8 @@ def main():
         cmd_check_proxy(*rest)
     elif cmd == "run" and not rest:
         cmd_run()
+    elif cmd == "scan-worker" and not rest:
+        cmd_scan_worker()
     elif cmd == "test-alert":
         send_telegram(load_config(), "✅ fb-watcher test alert")
     else:

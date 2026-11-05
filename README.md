@@ -76,7 +76,9 @@ When `braveduck.enabled` is true, each matching post is also added with `bravedu
 
 - This machine has no root access, so Chromium's missing system libraries (`libnss3`, `libnspr4`, `libasound2t64`) were unpacked into `libs/root` with `apt-get download` and `dpkg-deb -x`. `watcher.py` adds that folder to `LD_LIBRARY_PATH` itself.
 - Scraping breaks Facebook's ToS. Use a secondary account that has joined the groups, and keep `poll_seconds` at 60 or higher.
-- Each scan scrolls back until it reaches the newest post from the previous scan (the `boundary` table), up to `scrolls` scrolls and `sample_count` posts. If more than `sample_count` posts arrive between two scans, the oldest ones are missed; raise `sample_count` (maximum 50) for busy groups.
+- Each scan scrolls back until it reaches the newest post from the previous scan (the `boundary` table), up to `scrolls` scrolls and `sample_count` posts. The boundary only moves once a scan actually reaches it, so posts in a gap stay pending and get read in a later round. If 3 scans in a row fall short (for example, the boundary post was deleted), it moves anyway, and the board shows `incomplete scans on <group>`. Raise `sample_count` (maximum 50) for busy groups.
+- Matching posts go through an outbox in `seen.db`. A post is marked as handled in the same step as its braveduck and Telegram deliveries are queued. Every round retries whatever is still queued, including after a restart, and a delivery that has failed 3 times shows on the board as `N of M deliveries failing`.
+- Each group scan runs as a separate process (`watcher.py scan-worker`). If a scan runs past 4 minutes, that process and all of its browser processes are killed, and only that group is skipped for the round.
 - If you're logged out, Facebook asks for an account action, or the browser can't start, the watcher sends a Telegram warning and exits. Timeouts, page-layout changes and access errors only skip that group for the current round.
 - `fbn_patch.py` patches fbn where it misses or mishandles posts (each patch is described at the top of the file):
   - a post fbn can't fully read is skipped, instead of failing the whole group;
