@@ -35,6 +35,28 @@ Stack: Python + Playwright. Scraping uses [fbn](https://github.com/viseshrp/fbn)
 
 The first pass over each group records the existing posts without sending alerts. After that, you get an alert only for new posts that match a keyword.
 
+## Several accounts and proxies
+
+Each account has its own browser profile, its own optional proxy, and its own list of groups. A group can be listed under only one account.
+
+```json
+"accounts": [
+  { "name": "default", "proxy": "", "groups": [{ "id": "3989249071208661", "name": "Tuyển Dụng AI Engineer Việt Nam" }] },
+  { "name": "second", "proxy": "http://user:pass@203.0.113.10:8080", "groups": [{ "id": "1329241984892387", "name": "Việc làm AI Engineer -Việt Nam" }] }
+]
+```
+
+- **Names:** lowercase letters, digits, `_` and `-`. The account named `default` uses `./profile`, so a config with only the old top-level `groups` list still works as one `default` account. Other accounts get `./profiles/<name>`.
+- **Proxy:** `http://`, `https://` or `socks5://`, written as `scheme://[user:pass@]host:port`. URL-encode special characters in the username or password, e.g. `@` becomes `%40`. Chromium can't use a SOCKS5 proxy that needs a username and password, so use an `http://` proxy for those. The proxy is used for the login window, cookie import and every scan, so Facebook always sees the account at the same address. Give each account its own proxy, and keep it the same over time.
+- **Commands per account:**
+  ```bash
+  .venv/bin/python watcher.py check-proxy second
+  .venv/bin/python watcher.py login second
+  .venv/bin/python watcher.py import-cookies ~/.config/fb-watcher/second.json second
+  ```
+  `check-proxy` prints the public IP the account's browser uses. Run it before logging in, to confirm the proxy works.
+- **Logged out:** if an account is logged out or needs an account check, only its groups pause. You get a Telegram warning naming the account, and the board shows `<error> on account <name>`. The service keeps running the other accounts, and stops (exit 3) only when every account is down. After logging the account in again, restart the service.
+
 ## braveduck job board
 
 When `braveduck.enabled` is true, each matching post is also added with `braveduck add`:
