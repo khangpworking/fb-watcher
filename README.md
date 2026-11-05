@@ -79,6 +79,7 @@ When `braveduck.enabled` is true, each matching post is also added with `bravedu
 - Each scan scrolls back until it reaches the newest post from the previous scan (the `boundary` table), up to `scrolls` scrolls and `sample_count` posts. If more than `sample_count` posts arrive between two scans, the oldest ones are missed; raise `sample_count` (maximum 50) for busy groups.
 - If you're logged out, Facebook asks for an account action, or the browser can't start, the watcher sends a Telegram warning and exits. Timeouts, page-layout changes and access errors only skip that group for the current round.
 - `fbn_patch.py` makes fbn skip a post it can't fully read, such as a shared post or one with a "Follow" button next to the author, instead of failing the whole group. If the patch no longer fits a new fbn version, the watcher stops at startup with a clear error. It also keeps a post whose own page fbn can't read (fbn opens each post to check its link) by using the post link Facebook's share link redirects to.
+- Since 2026-11-04, tapping a post's "…" menu on Facebook's mobile site jumps to "This Page is not available", so fbn's "Copy link" step can't work. `fbn_patch.py` gets the link by tapping the post's timestamp instead, reading the post ID from the page that opens, and going back. fbn still verifies every link.
 - When Facebook changes its layout, update fbn: change the commit in `requirements.txt`, then run `.venv/bin/pip install -r requirements.txt`. If fbn fails, it saves screenshots and says where in its error message.
 
 ## Run as a service
