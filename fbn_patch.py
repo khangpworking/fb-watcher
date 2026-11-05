@@ -1,107 +1,167 @@
-"""Make fbn skip posts it can't fully read instead of failing the whole scan.
+"""fb-watcher's patches to fbn (pinned 982cc97 in requirements.txt).
 
-fbn's feed script already skips a card it can't parse (a shared post, a "Follow"
-button beside the author, ...), but it also adds that card's problem to the
-page-wide `missing` list, and any entry there fails the page with
-LayoutChangedError. So one odd post hid every other post in the group.
+Each patch replaces an exact piece of fbn's page script or one function. A script
+patch whose text is no longer found raises at import, so an fbn update can't
+silently drop a fix: re-check this file whenever you bump the fbn commit.
 
-This keeps only the page-level problem (no single feed scroller) in `missing`;
-per-card problems move to `skippedCards`. Written against fbn @ 982cc97:
-re-check it when you bump the fbn commit in requirements.txt.
+1. Skip unreadable cards instead of failing the page.
+2. Recognise posts with an "AI content" label and posts the account already liked.
+3. Expose the parser's own timestamp node for each post.
+4. Get post links by tapping the timestamp (Facebook's "..." menu broke on 2026-11-04).
+5. One post whose link can't be read ends the scan early with the posts read so far,
+   instead of failing the group.
+6. Keep a post whose own page fbn can't render, but only if its identity still matches.
 """
 
-import fbn.mobile as mobile
+import logging
+import time
+from urllib.parse import parse_qs, urlsplit
 
-_ORIGINAL = "hasFeed: roots.length === 1, missing: Array.from(missing),"
-_PATCHED = (
-    "hasFeed: roots.length === 1,"
-    " missing: Array.from(missing).filter(name => name === 'unique_mobile_scroller'),"
-    " skippedCards: Array.from(missing),"
-)
+import fbn.mobile as mobile
+from playwright.sync_api import Error as PlaywrightError
+
+log = logging.getLogger("fbn_patch")
+
+_SCRIPT_PATCHES = [
+    # 1. fbn's feed script already skips a card it can't parse (a shared post, a
+    # "Follow" button by the author, ...) but also adds its problem to the page-wide
+    # `missing` list, which fails the whole page. Keep only the page-level problem.
+    (
+        "hasFeed: roots.length === 1, missing: Array.from(missing),",
+        "hasFeed: roots.length === 1,"
+        " missing: Array.from(missing).filter(name => name === 'unique_mobile_scroller'),"
+        " skippedCards: Array.from(missing),",
+        1,
+    ),
+    # 2a. "AI content, 8 minutes ago" is a badge rendered as a link, so fbn didn't
+    # strip it as a timestamp prefix and dropped the post.
+    (
+        "visible(child) && !child.closest('[role=\"link\"],a')\n"
+        "            && !child.querySelector('[role=\"link\"],a')",
+        "visible(child) && ((!child.closest('[role=\"link\"],a')\n"
+        "            && !child.querySelector('[role=\"link\"],a'))"
+        " || clean(child.innerText) === 'AI content')",
+        1,
+    ),
+    # 2b. An already-liked post's button reads "1LIKEpressed, ..." -> "likepressed".
+    ("(?:like|unlike)(?:,|$)", "(?:like|unlike)(?:pressed)?(?:,|$)", 2),
+    # 3. The timestamp node the parser proved belongs to this post (after any
+    # author/badge prefix), so the link step never re-guesses it.
+    (
+        "records.push({card, menu, expand, regions: body.regions,",
+        "records.push({card, menu, expand, timestampNode: timestamp.node, regions: body.regions,",
+        1,
+    ),
+]
 
 for name in ("MOBILE_SCAN_SCRIPT", "MOBILE_PERMALINK_SCAN_SCRIPT"):
     script = getattr(mobile, name)
-    if _ORIGINAL not in script:
-        raise RuntimeError(f"fbn_patch: {name} changed upstream; update fbn_patch.py for the new fbn version")
-    setattr(mobile, name, script.replace(_ORIGINAL, _PATCHED))
+    for old, new, count in _SCRIPT_PATCHES:
+        if script.count(old) != count:
+            raise RuntimeError(f"fbn_patch: {name} changed upstream ({old[:40]!r}); update fbn_patch.py")
+        script = script.replace(old, new)
+    setattr(mobile, name, script)
 
 
-# fbn also verifies each post's copied link by opening the post's own page. If fbn
-# can't read that page, the whole group scan fails, on every round, as long as the
-# post stays near the top. In that case, accept the post's own link if Facebook's
-# "Copy link" gave one directly, or if the share link (/share/p/...) redirected to
-# one in this group; otherwise fail as before.
+# 4. Tapping a post's "..." menu on m.facebook.com now jumps to "This Page is not
+# available", so "Copy link" is gone. Tapping the post's timestamp still opens
+# /story.php?story_fbid=<post>&id=<group>; read the IDs there and go back to the feed.
+# fbn verifies the link afterwards. Found and tested by Astra (codex): astra-debug/.
+_TIMESTAMP = r'''menu => {
+  const record = (SCRIPT)(true).records.find(r => r.menu === menu);
+  if (!record || !record.timestampNode || !record.timestampNode.isConnected) {
+    throw new Error('source timestamp missing');
+  }
+  return record.timestampNode;
+}'''.replace("SCRIPT", mobile.MOBILE_SCAN_SCRIPT)
+
+
+def _timestamp_post_link(page, menu, *, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    source_url = page.url
+    group = mobile._group_key(source_url)
+    if not group or not group.isdecimal():
+        raise mobile._layout_failure("numeric_source_group")
+    stamp = page.evaluate_handle(_TIMESTAMP, menu).as_element()
+    if stamp is None:
+        raise mobile._layout_failure("source_timestamp")
+    try:
+        # Dispatch to the timestamp: its containing header owns the action.
+        stamp.dispatch_event("click")
+        page.wait_for_url(
+            lambda url: url != source_url,
+            timeout=mobile._remaining_seconds(deadline, "timestamp_post_link") * 1000,
+        )
+        destination = urlsplit(page.url)
+        query = parse_qs(destination.query)
+        ids, groups = query.get("story_fbid", []), query.get("id", [])
+        if (destination.scheme != "https" or destination.hostname != "m.facebook.com"
+                or destination.path != "/story.php" or groups != [group]
+                or len(ids) != 1 or not ids[0].isdecimal()):
+            raise mobile._layout_failure("timestamp_post_in_source_group")
+        return f"https://www.facebook.com/groups/{group}/posts/{ids[0]}/"
+    finally:
+        try:
+            # Cleanup gets its own budget, even if the step above ran out of time.
+            if page.url != source_url:
+                page.go_back(wait_until="domcontentloaded", timeout=5000)
+                page.wait_for_url(source_url, timeout=5000)
+        finally:
+            stamp.dispose()
+
+
+# 5. fbn's scan loop has no way to skip one card, so a single post whose link step
+# fails used to throw away the whole group's round. If the feed is back where it was,
+# end the scan early instead: fbn returns the posts read so far as a bounded
+# (incomplete) result, and watcher.py keeps the old boundary for incomplete scans.
+partial_scans = []  # (reason class) of scans ended early, read by watcher.py for its log
+
+
+def copy_post_link(page, menu, *, timeout_seconds):
+    source_url = page.url
+    try:
+        return _timestamp_post_link(page, menu, timeout_seconds=timeout_seconds)
+    except mobile._ScanBudgetExpired:
+        raise
+    except (PlaywrightError, mobile.LayoutChangedError) as exc:
+        try:
+            restored = page.url == source_url and menu.evaluate("n => n.isConnected")
+        except PlaywrightError:
+            restored = False
+        if not restored:
+            raise
+        partial_scans.append(type(exc).__name__)
+        log.warning("post link step failed (%s); ending this scan with the posts read so far",
+                    type(exc).__name__)
+        raise mobile._ScanBudgetExpired() from exc
+
+
+mobile.copy_post_link = copy_post_link
+
+
+# 6. fbn also opens each post's own page to verify the link. Some posts' pages can't
+# be rendered by fbn (e.g. the "Copilot" guide post), which failed the group on every
+# round. Accept the link only when the failure was that render step and the page's own
+# URL, if it names a post, names the same one. A proven mismatch still fails.
 _resolve_post_link = mobile.resolve_post_link
+unverified = []  # post IDs accepted without the full page check, for diagnostics
 
 
 def resolve_post_link(target, copied, payload, allowed_group_keys, **kwargs):
     try:
         return _resolve_post_link(target, copied, payload, allowed_group_keys, **kwargs)
-    except mobile.LayoutChangedError:
-        link = mobile.parse_post_url(copied) or mobile.parse_post_url(target.url)
+    except mobile.LayoutChangedError as exc:
+        if getattr(exc, "_fbn_failure_phase", None) != "page_render":
+            raise
+        link = mobile.parse_post_url(copied)
+        final = mobile.parse_post_url(target.url)
         if link is None or link.group_key not in allowed_group_keys:
             raise
+        if final is not None and final.post_id != link.post_id:
+            raise
         unverified.append(link.post_id)
+        del unverified[:-50]
         return link.url
 
 
-unverified = []  # post IDs accepted on the copied link alone, for diagnostics
 mobile.resolve_post_link = resolve_post_link
-
-
-# Facebook's mobile post "..." menu broke on 2026-11-04: tapping it jumps to "This Page
-# is not available", so fbn can't use "Copy link". Instead, tap the post's own timestamp
-# (it opens /story.php?story_fbid=<post>&id=<group>), read the post ID, and go back to the
-# feed. fbn still verifies the link afterwards. Found and tested by Astra (codex), see
-# astra-debug/report.md.
-import time  # noqa: E402
-from urllib.parse import parse_qs, urlsplit  # noqa: E402
-
-
-_TIMESTAMP = r'''menu => {
-  const script = SCRIPT;
-  const record = script(true).records.find(r => r.menu === menu);
-  if (!record) throw new Error('source card missing');
-  const nodes = [...menu.parentElement.querySelectorAll('[aria-label]')]
-    .filter(n => n !== menu && n.getAttribute('aria-label').normalize('NFKC').replace(/[\u034f\u200b\u200e\u200f\ufeff]/g, '').replace(/\s+/g, ' ').trim().replace(/^[,\s]+/, '') === record.payload.timestampLabel);
-  if (nodes.length !== 1) throw new Error('unique source timestamp required');
-  return nodes[0];
-}'''.replace('SCRIPT', mobile.MOBILE_SCAN_SCRIPT)
-
-
-def copy_post_link(page, menu, *, timeout_seconds):
-    deadline = time.monotonic() + timeout_seconds
-    source_url = page.url
-    group = mobile._group_key(source_url)
-    if not group or not group.isdecimal():
-        raise mobile._layout_failure('numeric_source_group')
-    def remaining():
-        return mobile._remaining_seconds(deadline, 'timestamp_post_link') * 1000
-    stamp = page.evaluate_handle(_TIMESTAMP, menu).as_element()
-    if stamp is None:
-        raise mobile._layout_failure('source_timestamp')
-    try:
-        # Dispatch to the timestamp: its containing header owns the action.
-        stamp.dispatch_event('click')
-        page.wait_for_url(lambda url: url != source_url, timeout=remaining())
-        destination = urlsplit(page.url)
-        query = parse_qs(destination.query)
-        ids, groups = query.get('story_fbid', []), query.get('id', [])
-        if (destination.scheme != 'https' or destination.hostname != 'm.facebook.com'
-                or destination.path != '/story.php' or groups != [group]
-                or len(ids) != 1 or not ids[0].isdecimal()):
-            raise mobile._layout_failure('timestamp_post_in_source_group')
-        return f'https://www.facebook.com/groups/{group}/posts/{ids[0]}/'
-    finally:
-        try:
-            # Cleanup must still work if acquisition exhausted its deadline.
-            cleanup_ms = 5000
-            if page.url != source_url:
-                page.go_back(wait_until='domcontentloaded', timeout=cleanup_ms)
-                page.wait_for_url(source_url, timeout=cleanup_ms)
-            if not menu.evaluate('n => n.isConnected'):
-                raise mobile._layout_failure('original_feed_menu_restored')
-        finally:
-            stamp.dispose()
-
-mobile.copy_post_link = copy_post_link

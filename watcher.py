@@ -68,6 +68,9 @@ def normalize(text):
 
 def build_matcher(keywords):
     # A trailing '*' makes a prefix match: 'automat*' matches automate/automated/automation.
+    for k in keywords:
+        if not normalize(k.rstrip("*")).strip():
+            raise ConfigurationError(f"keyword {k!r} is empty; remove it from config.json")
     patterns = [
         re.compile(r"(?<!\w)" + re.escape(normalize(k.rstrip("*"))) + ("" if k.endswith("*") else r"(?!\w)"))
         for k in keywords
@@ -86,6 +89,10 @@ def open_db():
     db = sqlite3.connect(DB_PATH)
     db.execute("CREATE TABLE IF NOT EXISTS seen (post_key TEXT PRIMARY KEY, group_id TEXT, ts INTEGER)")
     db.execute("CREATE TABLE IF NOT EXISTS boundary (group_id TEXT PRIMARY KEY, post_id TEXT)")
+    # A group is initialized after its first successful scan, even one that found no posts.
+    db.execute("CREATE TABLE IF NOT EXISTS group_state (group_id TEXT PRIMARY KEY, initialized INTEGER NOT NULL)")
+    db.execute("INSERT OR IGNORE INTO group_state SELECT DISTINCT group_id, 1 FROM seen")
+    db.commit()
     return db
 
 
@@ -98,8 +105,13 @@ def mark_seen(db, key, group_id):
     db.commit()
 
 
-def group_has_history(db, group_id):
-    return db.execute("SELECT 1 FROM seen WHERE group_id = ? LIMIT 1", (group_id,)).fetchone() is not None
+def group_initialized(db, group_id):
+    return db.execute("SELECT 1 FROM group_state WHERE group_id = ? AND initialized", (group_id,)).fetchone() is not None
+
+
+def mark_group_initialized(db, group_id):
+    db.execute("INSERT OR REPLACE INTO group_state VALUES (?, 1)", (group_id,))
+    db.commit()
 
 
 # --- alerts -----------------------------------------------------------------
@@ -120,6 +132,9 @@ def send_telegram(cfg, text):
         print("telegram send failed:", e)
 
 
+MAX_JD_BYTES = 100_000
+
+
 def add_to_braveduck(cfg, post, group_id, group_name, hits):
     """Add a matched post to the braveduck job board via `braveduck add`."""
     bd = cfg.get("braveduck") or {}
@@ -128,9 +143,13 @@ def add_to_braveduck(cfg, post, group_id, group_name, hits):
     first_line = next((line.strip() for line in post["text"].splitlines() if line.strip()), "Facebook post")
     title = first_line if len(first_line) <= 120 else first_line[:117] + "..."
     group_url = f"https://www.facebook.com/groups/{group_id}/"
+    text = post["text"]
+    if len(text.encode()) > MAX_JD_BYTES:
+        # One command-line argument is limited to 128 KB; say so instead of failing the add.
+        text = text.encode()[:MAX_JD_BYTES].decode(errors="ignore") + "\n\n[Post cut at 100 KB; full text at the link.]"
     jd = (
-        f"{post['text']}\n\n---\n"
-        f"Author: {post['author'] or 'unknown'}\n"
+        f"{text}\n\n---\n"
+        f"Author: {post.get('author') or 'unknown'}\n"
         f"Group: {group_name} ({group_url})\n"
         f"Matched keywords: {', '.join(hits)}"
     )
@@ -173,19 +192,25 @@ def report_to_braveduck(cfg, ok, reason=""):
 # Exit code for problems a restart can't fix (login, account check); the systemd unit doesn't restart on it.
 EXIT_NEEDS_USER = 3
 FATAL_ERRORS = (AuthenticationRequiredError, AccountActionRequiredError, BrowserUnavailableError, ConfigurationError)
-ACCOUNT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+ACCOUNT_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 
 
 def parse_proxy(url):
     """Turn 'http://user:pass@host:port' (or https://, socks5://) into Playwright's proxy option."""
     if not url:
         return None
-    parts = urllib.parse.urlsplit(url)
-    if parts.scheme not in ("http", "https", "socks5") or not parts.hostname or not parts.port:
-        raise ConfigurationError("proxy must look like http://[user:pass@]host:port (or https://, socks5://)")
+    bad = ConfigurationError("proxy must look like http://[user:pass@]host:port (or https://, socks5://)")
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port
+    except ValueError:
+        raise bad from None
+    if parts.scheme not in ("http", "https", "socks5") or not parts.hostname or not port:
+        raise bad
     if parts.scheme == "socks5" and parts.username:
         raise ConfigurationError("Chromium can't use a SOCKS5 proxy with a username/password; use an http:// proxy")
-    proxy = {"server": f"{parts.scheme}://{parts.hostname}:{parts.port}"}
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    proxy = {"server": f"{parts.scheme}://{host}:{port}"}
     if parts.username:
         proxy["username"] = urllib.parse.unquote(parts.username)
         proxy["password"] = urllib.parse.unquote(parts.password or "")
@@ -198,11 +223,14 @@ def load_accounts(cfg):
     accounts, seen_groups = [], set()
     for entry in raw:
         name = entry.get("name", "")
-        if not ACCOUNT_NAME_RE.match(name) or any(a["name"] == name for a in accounts):
+        if not isinstance(name, str) or not ACCOUNT_NAME_RE.fullmatch(name) or any(a["name"] == name for a in accounts):
             raise ConfigurationError(f"account name {name!r} must be unique, lowercase letters/digits/_/-")
         groups = []
         for g in entry.get("groups", []):
             ref = parse_group_ref(str(g["id"]))
+            if not ref.key.isdecimal():
+                # Post links come from /story.php?id=<numeric group>; a slug can't be checked against it.
+                raise ConfigurationError(f"group {ref.key!r}: use the group's numeric ID, not its name")
             if ref.key in seen_groups:
                 raise ConfigurationError(f"group {ref.key} is listed under more than one account")
             seen_groups.add(ref.key)
@@ -362,7 +390,7 @@ def cmd_run():
     for account in accounts:
         account["source"] = make_source(account, headless=cfg.get("headless", True))
 
-    failing = {}  # group name -> (first failure time, consecutive failed rounds, last error)
+    failing = {}  # (account, group id) -> (group name, first failure time, consecutive failed rounds, error type)
     down = {}  # account name -> reason; its groups are skipped until you log it in again and restart
     while True:
         # Board health: ok if any group scanned this round, no group has failed 3 rounds in a row
@@ -374,7 +402,7 @@ def cmd_run():
             for group_ref, name in account["groups"]:
                 gid = group_ref.key
                 # First time we see a group, record existing posts silently instead of flooding alerts.
-                bootstrap = not group_has_history(db, gid)
+                bootstrap = not group_initialized(db, gid)
                 try:
                     posts = scrape_group(account["source"], db, group_ref, policy)
                 except FATAL_ERRORS as e:
@@ -387,12 +415,16 @@ def cmd_run():
                 except FbnError as e:
                     # Timeouts, layout drift, access problems: skip this group for one round.
                     print(f"[{name}] {type(e).__name__}: {e} (will retry next round)")
-                    last_error = f"{type(e).__name__}: {e}"
-                    since, rounds, _ = failing.get(name, (time.strftime("%H:%M"), 0, ""))
-                    failing[name] = (since, rounds + 1, type(e).__name__)
+                    # Board text: error type and our own identifiers only, never fbn's message.
+                    last_error = f"{type(e).__name__} on {name} ({gid})"
+                    key = (account["name"], gid)
+                    _, since, rounds, _ = failing.get(key, (name, time.strftime("%H:%M"), 0, ""))
+                    failing[key] = (name, since, rounds + 1, type(e).__name__)
                     continue
                 scanned += 1
-                failing.pop(name, None)
+                failing.pop((account["name"], gid), None)
+                if bootstrap:
+                    mark_group_initialized(db, gid)
 
                 new = 0
                 for post in posts:
@@ -416,7 +448,7 @@ def cmd_run():
                       + (" (bootstrap, no alerts)" if bootstrap else ""))
                 time.sleep(random.randint(3, 8))
         problems = list(down.values()) + [
-            f"{err} on {name} since {since}" for name, (since, rounds, err) in failing.items() if rounds >= 3
+            f"{err} on {name} ({key[1]}) since {since}" for key, (name, since, rounds, err) in failing.items() if rounds >= 3
         ]
         if len(down) == len(accounts):
             report_to_braveduck(cfg, False, "; ".join(problems))
