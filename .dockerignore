@@ -1,0 +1,12 @@
+.git
+.venv
+libs
+profile
+profiles
+seen.db
+config.json
+*.png
+astra-*
+failure-screenshots
+login-shots
+__pycache__

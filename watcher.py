@@ -6,6 +6,8 @@ Usage (ACCOUNT defaults to the first account in config.json):
   python watcher.py check-proxy [ACCOUNT]           # show the public IP the account's browser uses
   python watcher.py run                             # headless polling loop over all accounts
   python watcher.py test-alert
+  python watcher.py serve-braveduck                 # scan the groups braveduck users follow (braveduck_service)
+  python watcher.py check-group LINK [ACCOUNT]      # show what serve-braveduck sees on a group's page
 """
 
 import json
@@ -24,9 +26,12 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-PROFILE_DIR = ROOT / "profile"
-DB_PATH = ROOT / "seen.db"
-CONFIG_PATH = ROOT / "config.json"
+# FB_WATCHER_DATA keeps the login profiles, seen.db and config.json apart from
+# the code (a container's volume); by default they sit next to watcher.py.
+DATA = Path(os.environ.get("FB_WATCHER_DATA") or ROOT)
+PROFILE_DIR = DATA / "profile"
+DB_PATH = DATA / "seen.db"
+CONFIG_PATH = DATA / "config.json"
 
 # Chromium system libs unpacked without root (see README); the browser process inherits this.
 LOCAL_LIBS = ROOT / "libs" / "root" / "usr" / "lib" / "x86_64-linux-gnu"
@@ -266,7 +271,7 @@ def load_accounts(cfg):
         accounts.append({
             "name": name,
             # 'default' keeps the original ./profile so existing logins keep working.
-            "profile": PROFILE_DIR if name == "default" else ROOT / "profiles" / name,
+            "profile": PROFILE_DIR if name == "default" else DATA / "profiles" / name,
             "proxy": parse_proxy(entry.get("proxy", "")),
             "groups": groups,
         })
@@ -418,7 +423,7 @@ def advance_boundary(db, group_id, posts, complete):
     return rounds
 
 
-LOGIN_DONE_FILE = ROOT / ".login-done"
+LOGIN_DONE_FILE = DATA / ".login-done"
 
 
 def wait_for_login():
@@ -595,6 +600,86 @@ def cmd_run():
         time.sleep(random.randint(lo, hi))
 
 
+def braveduck_api(cfg):
+    """The braveduck scanner API from config `braveduck_service` {url, key_file}."""
+    import braveduck_service as bds
+
+    svc = cfg.get("braveduck_service") or {}
+    if not svc.get("url") or not svc.get("key_file"):
+        raise SystemExit("config.json needs braveduck_service: {\"url\": …, \"key_file\": …}")
+    key = Path(os.path.expanduser(svc["key_file"])).read_text(encoding="utf-8").strip()
+    return bds.ScannerAPI(svc["url"], key)
+
+
+def cmd_check_group(link, account_name=None):
+    import braveduck_service as bds
+
+    account = find_account(load_config(), account_name)
+    ref = parse_group_ref(link)
+    name, vis, note, numeric = bds.check_group(account["profile"], account["proxy"],
+                                               f"https://m.facebook.com/groups/{ref.key}/", ref.key)
+    print(json.dumps({"key": ref.key, "name": name, "visibility": vis, "note": note, "numeric_id": numeric},
+                     ensure_ascii=False, indent=2))
+
+
+def cmd_serve_braveduck():
+    """Scan the groups braveduck's users follow: check each group's page for its
+    name and visibility, scan public ones, hand new posts to braveduck."""
+    import braveduck_service as bds
+
+    cfg = load_config()
+    api = braveduck_api(cfg)
+    account = load_accounts(cfg)[0]  # one account reads every followed group
+    db = open_db()
+    db.execute("CREATE TABLE IF NOT EXISTS group_alias (key TEXT PRIMARY KEY, numeric_id TEXT NOT NULL)")
+    lo, hi = cfg["poll_seconds"]
+    policy = ScanPolicy(sample_count=cfg["sample_count"], max_scrolls=cfg["scrolls"])
+    headless = cfg.get("headless", True)
+    rng = random.Random()
+    while True:
+        try:
+            groups = api.groups()
+        except (OSError, ValueError) as e:
+            print(f"braveduck unreachable: {type(e).__name__} (retrying)")
+            bds.sleep_between(lo, hi, rng)
+            continue
+        for g in groups:
+            key = g["key"]
+            try:
+                if bds.due_for_check(g):
+                    name, vis, note, numeric = bds.check_group(account["profile"], account["proxy"],
+                                                               f"https://m.facebook.com/groups/{key}/", key, headless)
+                    if numeric:
+                        db.execute("INSERT OR REPLACE INTO group_alias VALUES (?, ?)", (key, numeric))
+                        db.commit()
+                    api.status(key, vis, name, note)
+                    g["visibility"] = vis
+                    print(f"[{key}] {vis} {name!r} {note}")
+                    time.sleep(rng.randint(3, 8))
+                if g["visibility"] != "public":
+                    continue
+                row = db.execute("SELECT numeric_id FROM group_alias WHERE key = ?", (key,)).fetchone()
+                numeric = key if key.isdecimal() else (row[0] if row else None)
+                if not numeric:
+                    continue  # checked next round
+                gid = numeric
+                posts, complete = run_scan(account, parse_group_ref(gid), policy, get_boundary(db, gid), headless)
+                fresh = bds.new_posts(posts, lambda k: is_seen(db, k))
+                if fresh:
+                    res = api.posts(key, fresh)
+                    for p in fresh:
+                        mark_seen(db, p["key"], gid)
+                    print(f"[{key}] {len(fresh)} new post(s) → {res}")
+                advance_boundary(db, gid, posts, complete)
+                time.sleep(rng.randint(3, 8))
+            except FATAL_ERRORS as e:
+                send_telegram(cfg, f"⚠️ fb-watcher (braveduck scanner): account stopped ({type(e).__name__}). Log in again, then restart.")
+                raise SystemExit(EXIT_NEEDS_USER)
+            except (FbnError, OSError, ValueError) as e:
+                print(f"[{key}] {type(e).__name__}: {e} (next round)")
+        bds.sleep_between(lo, hi, rng)
+
+
 def main():
     args = sys.argv[1:] or ["run"]
     cmd, rest = args[0], args[1:]
@@ -608,6 +693,10 @@ def main():
         cmd_run()
     elif cmd == "scan-worker" and not rest:
         cmd_scan_worker()
+    elif cmd == "serve-braveduck" and not rest:
+        cmd_serve_braveduck()
+    elif cmd == "check-group" and len(rest) in (1, 2):
+        cmd_check_group(*rest)
     elif cmd == "test-alert":
         send_telegram(load_config(), "✅ fb-watcher test alert")
     else:
