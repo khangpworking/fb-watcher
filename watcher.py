@@ -55,7 +55,8 @@ from fbn.models import ScanPolicy  # noqa: E402
 
 
 def load_config():
-    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    # A container in braveduck's compose may run on environment settings alone.
+    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
     cfg.setdefault("poll_seconds", [90, 180])
     cfg.setdefault("scrolls", 4)
     cfg.setdefault("sample_count", 10)
@@ -604,9 +605,12 @@ def braveduck_api(cfg):
     """The braveduck scanner API from config `braveduck_service` {url, key_file}."""
     import braveduck_service as bds
 
-    svc = cfg.get("braveduck_service") or {}
+    svc = dict(cfg.get("braveduck_service") or {})
+    svc.setdefault("url", os.environ.get("BRAVEDUCK_SCANNER_URL", ""))
+    svc.setdefault("key_file", os.environ.get("BRAVEDUCK_SCANNER_KEY_FILE", ""))
     if not svc.get("url") or not svc.get("key_file"):
-        raise SystemExit("config.json needs braveduck_service: {\"url\": …, \"key_file\": …}")
+        raise SystemExit("set braveduck_service {\"url\", \"key_file\"} in config.json, "
+                         "or BRAVEDUCK_SCANNER_URL and BRAVEDUCK_SCANNER_KEY_FILE")
     key = Path(os.path.expanduser(svc["key_file"])).read_text(encoding="utf-8").strip()
     return bds.ScannerAPI(svc["url"], key)
 

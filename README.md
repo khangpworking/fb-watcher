@@ -133,11 +133,13 @@ each person's own search terms. A group counts as public only when its page
 says "Public group" (or "Nhóm Công khai"); private groups and unclear ones are
 reported and never scanned for others, since their posts are for members.
 
-Config (`config.json`):
+Config: `braveduck_service` in `config.json`, or the environment (the
+Dockerfile sets these, and needs no `config.json`):
 
 ```json
 "braveduck_service": { "url": "http://braveduck:8090", "key_file": "/run/secrets/scanner_secret" }
 ```
+`BRAVEDUCK_SCANNER_URL` / `BRAVEDUCK_SCANNER_KEY_FILE`.
 
 Check what it sees on one group before relying on it:
 
