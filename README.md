@@ -86,6 +86,7 @@ When `braveduck.enabled` is true, each matching post is also added with `bravedu
   - Facebook's post "…" menu broke on 2026-11-04, so links come from tapping the post's timestamp instead (fbn still verifies them);
   - if one post's link can't be read, the scan ends early and keeps the posts read so far;
   - a post whose own page fbn can't render is kept only if the page's address still names the same post.
+  - posts already handled are remembered (`post_cache` in `seen.db`), so scans don't tap their timestamp or open their page again. A round costs one feed load plus a visit per new post. Before this, every round revisited every visible post, roughly 300 post pages an hour, and Facebook started returning empty post pages.
 
   If a patch no longer fits a new fbn version, the watcher stops at startup with a clear error.
 - Group IDs must be the numeric ID from the group's URL. Group names (slugs) are rejected, because post links are checked against the numeric ID.
@@ -150,3 +151,53 @@ python watcher.py check-group https://www.facebook.com/groups/<id>/
 braveduck's `deploy/hosted` runs this from the `Dockerfile` here (compose
 profile `facebook`); `FB_WATCHER_DATA` puts the login profile, `seen.db` and
 `config.json` in a volume.
+
+## Fetch one post
+
+Read a single group post by its link, on demand. Other tools can call it from the command line or import it.
+
+```bash
+.venv/bin/python watcher.py fetch-post URL [ACCOUNT] [--json] [--assets-dir DIR]
+```
+
+```python
+from fetch_post import fetch_post, FetchError
+post = fetch_post("https://www.facebook.com/groups/<group>/posts/<post>/", account="default", assets_dir="/tmp/imgs")
+```
+
+- **URL:** `www.`, `m.` or `web.facebook.com` group links (`/groups/<g>/posts/<id>/`, `/groups/<g>/permalink/<id>/`), or share links (`/share/p/<code>/`).
+- **ACCOUNT:** an account name from the config; defaults to the first account. Uses that account's profile and proxy.
+- **How it reads:** it opens the post on the **desktop** site. Since 2026-11-05, Facebook answers direct loads of mobile post pages with an empty page, while the desktop post page renders in full, including posts in public groups the account hasn't joined. It reads only that one post, never a feed.
+- **Sharing the profile with the watcher:** fetch-post takes the profile's lock for its whole read, about 10–20 seconds. If a scan is running it waits, for up to 4 minutes. A scan that finds fetch-post holding the lock also waits, for up to 90 seconds.
+
+`--json` prints one object. Schema version 1:
+
+| Field | Meaning |
+|---|---|
+| `schema` | `1`. A new number means fields changed incompatibly. |
+| `url` | Canonical link, `https://www.facebook.com/groups/<group>/posts/<post_id>/` |
+| `post_id`, `group_key` | IDs from the link. `group_id` is the same as `group_key` when it's numeric, otherwise `null`. |
+| `group_name`, `author` | As shown on the post (`null` if not found) |
+| `text` | Full post text, with "See more" expanded |
+| `published_at` | ISO 8601 with offset, from the date tooltip, read in `timezone` from the config (default `Asia/Ho_Chi_Minh`); `null` if not read. `published_label` is the tooltip text. |
+| `images` | Image URLs in the post (not comments). These Facebook CDN links expire after a few days. |
+| `image_paths` | With `--assets-dir`, the downloaded files (`<post_id>-<n>.<ext>`); otherwise `[]` |
+| `fetched_at` | When it was read (UTC) |
+
+If it fails, `--json` prints `{"schema": 1, "error": "<kind>", "message": "..."}`.
+
+| Exit code | `error` | Meaning |
+|---|---|---|
+| 0 | | OK |
+| 1 | `error` | Anything else: a browser or network error, or a timeout |
+| 2 | `bad_url`, `bad_account` | Not a supported link, unknown account, or bad arguments |
+| 3 | `login_required` | The account isn't logged in, or Facebook wants an account check |
+| 4 | `not_visible` | Post deleted, private, or in a group the account hasn't joined |
+| 5 | `profile_busy` | The profile stayed busy for 4 minutes |
+
+## Tests
+
+```bash
+.venv/bin/python tests/test_run_loop.py     # run loop, outbox, boundary, scan worker; no Facebook
+.venv/bin/python tests/test_fetch_post.py   # fetch-post arguments, URLs, exit codes; no Facebook
+```

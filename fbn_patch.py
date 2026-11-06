@@ -11,9 +11,12 @@ silently drop a fix: re-check this file whenever you bump the fbn commit.
 5. One post whose link can't be read ends the scan early with the posts read so far,
    instead of failing the group.
 6. Keep a post whose own page fbn can't render, but only if its identity still matches.
+7. Skip the timestamp tap and the post-page check for posts already handled
+   (`known_links`, filled by watcher.py), so a round costs one feed load plus new posts.
 """
 
 import logging
+import re
 import time
 from urllib.parse import parse_qs, urlsplit
 
@@ -123,9 +126,40 @@ def _timestamp_post_link(page, menu, *, timeout_seconds):
 # (incomplete) result, and watcher.py keeps the old boundary for incomplete scans.
 partial_scans = []  # (reason class) of scans ended early, read by watcher.py for its log
 
+# 7. fbn reads every visible card each round and, for each, taps the timestamp and opens
+# the post's page to verify it: ~2 Facebook page visits per post per round, even for posts
+# handled long ago. Facebook started answering post pages with empty bodies (rate
+# limiting) on 2026-11-05/06. watcher.py fills `known_links` with fingerprint -> URL of
+# posts it has already handled; for those, skip both visits. A repost with the same author
+# and opening text maps to the earlier post; its content was already delivered.
+known_links = {}
+
+
+def fingerprint(author, text):
+    return f"{author or ''}|{re.sub(r'\s+', ' ', text or '').strip().lower()[:80]}"
+
+
+_PAYLOAD = r'''menu => {
+  const record = (SCRIPT)(true).records.find(r => r.menu === menu);
+  return record ? {author: record.payload.author, text: record.payload.text} : null;
+}'''.replace("SCRIPT", mobile.MOBILE_SCAN_SCRIPT)
+
+
+def _known_link(page, menu):
+    if not known_links:
+        return None
+    try:
+        payload = page.evaluate(_PAYLOAD, menu)
+    except PlaywrightError:
+        return None
+    return known_links.get(fingerprint(payload["author"], payload["text"])) if payload else None
+
 
 def copy_post_link(page, menu, *, timeout_seconds):
     source_url = page.url
+    known = _known_link(page, menu)
+    if known:
+        return known
     try:
         return _timestamp_post_link(page, menu, timeout_seconds=timeout_seconds)
     except mobile._ScanBudgetExpired:
@@ -154,12 +188,20 @@ mobile.copy_post_link = copy_post_link
 # URL, if it names a post, names the same one. A proven mismatch still fails.
 _resolve_post_link = mobile.resolve_post_link
 unverified = []  # post IDs accepted without the full page check, for diagnostics
+known_urls = set()  # URLs in known_links; filled together with it
 
 
 def resolve_post_link(target, copied, payload, allowed_group_keys, **kwargs):
+    if copied in known_urls:
+        return copied  # verified when it was first handled
+    # A post page renders in a few seconds; an empty (rate-limited) one never does, and
+    # fbn's own 30 s wait per post can push a whole scan past its time limit.
+    kwargs["timeout_seconds"] = min(kwargs.get("timeout_seconds", 10), 10)
     try:
         return _resolve_post_link(target, copied, payload, allowed_group_keys, **kwargs)
-    except mobile.LayoutChangedError as exc:
+    except (mobile.LayoutChangedError, mobile.RenderTimeoutError) as exc:
+        # RenderTimeoutError: Facebook served an empty post page (rate limiting). The link
+        # itself came from Facebook's own timestamp navigation, so keep it, unverified.
         if getattr(exc, "_fbn_failure_phase", None) != "page_render":
             raise
         link = mobile.parse_post_url(copied)

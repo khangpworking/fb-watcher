@@ -5,6 +5,7 @@ Usage (ACCOUNT defaults to the first account in config.json):
   python watcher.py import-cookies FILE [ACCOUNT]   # or: import cookies exported from a logged-in browser
   python watcher.py check-proxy [ACCOUNT]           # show the public IP the account's browser uses
   python watcher.py run                             # headless polling loop over all accounts
+  python watcher.py fetch-post URL [ACCOUNT] [--json] [--assets-dir DIR]   # read one post (README)
   python watcher.py test-alert
   python watcher.py serve-braveduck                 # scan the groups braveduck users follow (braveduck_service)
   python watcher.py check-group LINK [ACCOUNT]      # show what serve-braveduck sees on a group's page
@@ -38,7 +39,7 @@ LOCAL_LIBS = ROOT / "libs" / "root" / "usr" / "lib" / "x86_64-linux-gnu"
 if LOCAL_LIBS.is_dir():
     os.environ["LD_LIBRARY_PATH"] = f"{LOCAL_LIBS}:{os.environ.get('LD_LIBRARY_PATH', '')}"
 
-import fbn_patch  # noqa: E402,F401  (skip unreadable posts instead of failing the scan)
+import fbn_patch  # noqa: E402  (fixes to fbn; see the top of fbn_patch.py)
 from fbn import exceptions as fbn_exceptions  # noqa: E402
 from fbn.auth import load_facebook_cookies  # noqa: E402
 from fbn.config import BrowserSettings  # noqa: E402
@@ -48,6 +49,7 @@ from fbn.exceptions import (  # noqa: E402
     BrowserUnavailableError,
     ConfigurationError,
     FbnError,
+    ProfileInUseError,
 )
 from fbn.extractor import parse_group_ref  # noqa: E402
 from fbn.mobile import MobilePostSource  # noqa: E402
@@ -103,6 +105,11 @@ def open_db():
     if "incomplete" not in [row[1] for row in db.execute("PRAGMA table_info(group_state)")]:
         # Consecutive scans that didn't reach the stored boundary.
         db.execute("ALTER TABLE group_state ADD COLUMN incomplete INTEGER NOT NULL DEFAULT 0")
+    # Fingerprint (author + opening text) -> link of every post seen, so scans can skip
+    # re-visiting posts already handled (see fbn_patch.known_links).
+    db.execute("""CREATE TABLE IF NOT EXISTS post_cache (
+        group_id TEXT, fingerprint TEXT, url TEXT NOT NULL, ts INTEGER NOT NULL,
+        PRIMARY KEY (group_id, fingerprint))""")
     # Deliveries still owed for matched posts: one row per post and sink, deleted once delivered.
     db.execute("""CREATE TABLE IF NOT EXISTS outbox (
         post_key TEXT, sink TEXT, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
@@ -341,6 +348,7 @@ def set_boundary(db, group_id, post_id):
 # children instead of freezing every other group (a stalled navigation can block fbn's
 # cleanup with no timeout of its own).
 SCAN_WALL_SECONDS = 240
+PROFILE_WAIT_SECONDS = 90
 INCOMPLETE_ROUNDS_BEFORE_GAP = 3
 
 
@@ -348,10 +356,30 @@ class ScanWorkerError(FbnError):
     """The scan worker crashed, hung, or returned something unreadable."""
 
 
-def scan_in_process(account, group_ref, policy, boundary, headless=True):
+def known_links(db, group_id, limit=1000):
+    rows = db.execute("SELECT fingerprint, url FROM post_cache WHERE group_id = ? ORDER BY ts DESC LIMIT ?",
+                      (group_id, limit)).fetchall()
+    return dict(rows)
+
+
+def scan_in_process(account, group_ref, policy, boundary, headless=True, known=None):
     """Scan one group; return (posts newest first, complete) where complete means the
-    scan reached `boundary` (or there was none yet)."""
-    scan = make_source(account, headless).fetch_recent(group_ref, policy, boundary_post_id=boundary)
+    scan reached `boundary` (or there was none yet). `known`: fingerprint -> URL of posts
+    already handled, which the scan doesn't re-visit."""
+    fbn_patch.known_links.clear()
+    fbn_patch.known_links.update(known or {})
+    fbn_patch.known_urls.clear()
+    fbn_patch.known_urls.update(fbn_patch.known_links.values())
+    give_up = time.monotonic() + PROFILE_WAIT_SECONDS
+    while True:
+        try:
+            scan = make_source(account, headless).fetch_recent(group_ref, policy, boundary_post_id=boundary)
+            break
+        except ProfileInUseError:
+            # Another tool (e.g. `watcher.py fetch-post`) is using this account's browser.
+            if time.monotonic() >= give_up:
+                raise
+            time.sleep(3)
     posts = sorted(scan.posts, key=lambda post: post.position)
     complete = boundary is None or any(post.post_id == boundary for post in posts)
     return [
@@ -361,8 +389,8 @@ def scan_in_process(account, group_ref, policy, boundary, headless=True):
     ], complete
 
 
-def scan_in_subprocess(account, group_ref, policy, boundary, headless=True):
-    request = {
+def scan_in_subprocess(account, group_ref, policy, boundary, headless=True, known=None):
+    request = {"known": known or {},
         "profile": str(account["profile"]), "proxy": account["proxy"], "group": group_ref.key,
         "sample_count": policy.sample_count, "max_scrolls": policy.max_scrolls,
         "boundary": boundary, "headless": headless,
@@ -400,7 +428,8 @@ def cmd_scan_worker():
     policy = ScanPolicy(sample_count=request["sample_count"], max_scrolls=request["max_scrolls"])
     try:
         posts, complete = scan_in_process(
-            account, parse_group_ref(request["group"]), policy, request["boundary"], request["headless"])
+            account, parse_group_ref(request["group"]), policy, request["boundary"], request["headless"],
+            request.get("known"))
         reply = {"ok": True, "posts": posts, "complete": complete}
     except Exception as e:  # sent back to the parent, which raises it there
         reply = {"ok": False, "error": type(e).__name__, "message": str(e)[:500]}
@@ -508,9 +537,18 @@ def deliver_pending(cfg, db):
     return pending, failing
 
 
+def cache_posts(db, posts, group_id):
+    """Remember every scanned post's link, so later scans don't revisit it."""
+    with db:
+        for post in posts:
+            db.execute("INSERT OR IGNORE INTO post_cache VALUES (?, ?, ?, ?)",
+                       (group_id, fbn_patch.fingerprint(post["author"], post["text"]), post["url"], int(time.time())))
+
+
 def record_posts(db, posts, group_id, group_name, bootstrap, match):
     """Mark new posts seen and queue deliveries for matches, in one transaction per post."""
     new = 0
+    cache_posts(db, posts, group_id)
     for post in posts:
         if is_seen(db, post["key"]):
             continue
@@ -553,7 +591,8 @@ def cmd_run():
                 # First successful scan of a group records existing posts silently instead of flooding alerts.
                 bootstrap = not group_initialized(db, gid)
                 try:
-                    posts, complete = run_scan(account, group_ref, policy, get_boundary(db, gid), headless)
+                    posts, complete = run_scan(account, group_ref, policy, get_boundary(db, gid), headless,
+                                               known_links(db, gid))
                 except FATAL_ERRORS as e:
                     down[account["name"]] = f"{type(e).__name__} on account {account['name']}"
                     send_telegram(cfg, f"⚠️ fb-watcher: account {account['name']} stopped ({type(e).__name__}): {e}\n"
@@ -667,12 +706,15 @@ def cmd_serve_braveduck():
                 if not numeric:
                     continue  # checked next round
                 gid = numeric
-                posts, complete = run_scan(account, parse_group_ref(gid), policy, get_boundary(db, gid), headless)
+                posts, complete = run_scan(account, parse_group_ref(gid), policy, get_boundary(db, gid), headless,
+                                           known_links(db, gid))
+                cache_posts(db, posts, gid)
                 fresh = bds.new_posts(posts, lambda k: is_seen(db, k))
                 if fresh:
                     res = api.posts(key, fresh)
-                    for p in fresh:
-                        mark_seen(db, p["key"], gid)
+                    with db:
+                        for p in fresh:
+                            mark_seen(db, p["key"], gid)
                     print(f"[{key}] {len(fresh)} new post(s) → {res}")
                 advance_boundary(db, gid, posts, complete)
                 time.sleep(rng.randint(3, 8))
@@ -701,6 +743,9 @@ def main():
         cmd_serve_braveduck()
     elif cmd == "check-group" and len(rest) in (1, 2):
         cmd_check_group(*rest)
+    elif cmd == "fetch-post":
+        import fetch_post
+        sys.exit(fetch_post.main(rest))
     elif cmd == "test-alert":
         send_telegram(load_config(), "✅ fb-watcher test alert")
     else:
