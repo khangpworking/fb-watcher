@@ -115,3 +115,38 @@ systemctl --user restart fb-watcher
 ```
 
 On WSL, user services only run while a WSL session is open. To keep it running without one, run `loginctl enable-linger $USER`; this may need admin rights.
+
+## As braveduck's scanner (shared server)
+
+On a braveduck shared server, people follow Facebook groups by pasting a
+group's link on their board. fb-watcher reads those groups for them, with one
+logged-in account:
+
+```bash
+python watcher.py serve-braveduck
+```
+
+Each round it asks braveduck which groups are followed, opens each new group's
+page once a day to read its name and whether it's a **public** group, scans
+public groups, and hands their new posts to braveduck, which matches them to
+each person's own search terms. A group counts as public only when its page
+says "Public group" (or "Nhóm Công khai"); private groups and unclear ones are
+reported and never scanned for others, since their posts are for members.
+
+Config: `braveduck_service` in `config.json`, or the environment (the
+Dockerfile sets these, and needs no `config.json`):
+
+```json
+"braveduck_service": { "url": "http://braveduck:8090", "key_file": "/run/secrets/scanner_secret" }
+```
+`BRAVEDUCK_SCANNER_URL` / `BRAVEDUCK_SCANNER_KEY_FILE`.
+
+Check what it sees on one group before relying on it:
+
+```bash
+python watcher.py check-group https://www.facebook.com/groups/<id>/
+```
+
+braveduck's `deploy/hosted` runs this from the `Dockerfile` here (compose
+profile `facebook`); `FB_WATCHER_DATA` puts the login profile, `seen.db` and
+`config.json` in a volume.
