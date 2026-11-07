@@ -258,6 +258,14 @@ curl -s -X POST http://127.0.0.1:8091/fetch-post \
   -d '{"url": "https://www.facebook.com/groups/<group>/posts/<post>/"}'
 ```
 
+**As a service on this machine:** `deploy/fb-watcher-api.service` is a systemd user service that runs the API on `127.0.0.1:8091` with the key from `~/.config/fb-watcher/api.key` (mode 0600). braveduck, on the same machine, calls it server-side.
+
+```bash
+ln -sf ~/fb-watcher/deploy/fb-watcher-api.service ~/.config/systemd/user/fb-watcher-api.service
+systemctl --user daemon-reload
+systemctl --user enable --now fb-watcher-api
+```
+
 **In Docker (optional):** the image already includes the API. To run it, start the container with the command `api --host 0.0.0.0 --port 8091` and mount the key file. braveduck's `deploy/hosted` files aren't changed here.
 
 ## Tests
