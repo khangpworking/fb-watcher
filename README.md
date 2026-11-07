@@ -167,6 +167,7 @@ post = fetch_post("https://www.facebook.com/groups/<group>/posts/<post>/", accou
 
 - **URL:** `www.`, `m.` or `web.facebook.com` group links (`/groups/<g>/posts/<id>/`, `/groups/<g>/permalink/<id>/`), or share links (`/share/p/<code>/`).
 - **ACCOUNT:** an account name from the config; defaults to the first account. Uses that account's profile and proxy.
+- **`--public-only`:** return the post only if its group's page says "Public group" (or "Nhóm Công khai"). Each group's visibility is checked once a day and remembered in `seen.db` (`group_visibility`).
 - **How it reads:** it opens the post on the **desktop** site. Since 2026-11-05, Facebook answers direct loads of mobile post pages with an empty page, while the desktop post page renders in full, including posts in public groups the account hasn't joined. It reads only that one post, never a feed.
 - **Sharing the profile with the watcher:** fetch-post takes the profile's lock for its whole read, about 10–20 seconds. If a scan is running it waits, for up to 4 minutes. A scan that finds fetch-post holding the lock also waits, for up to 90 seconds.
 
@@ -194,10 +195,61 @@ If it fails, `--json` prints `{"schema": 1, "error": "<kind>", "message": "..."}
 | 3 | `login_required` | The account isn't logged in, or Facebook wants an account check |
 | 4 | `not_visible` | Post deleted, private, or in a group the account hasn't joined |
 | 5 | `profile_busy` | The profile stayed busy for 4 minutes |
+| 6 | `not_public` | With `--public-only`: the post's group isn't a confirmed public group, so nothing of the post is returned |
+
+## HTTP API
+
+A small HTTP API, so other services (for example braveduck's Go server, in another container) can use fetch-post and check-group without running Python. It doesn't change the watcher, which keeps running as before.
+
+```bash
+.venv/bin/python watcher.py api [--host 127.0.0.1] [--port 8091] [--docs]
+```
+
+- **Key:** required. Put a random key of at least 16 characters in a file (`head -c 32 /dev/urandom | base64 > ~/.config/fb-watcher/api.key; chmod 600 …`), then point `FB_WATCHER_API_KEY_FILE`, or `api.key_file` in the config, at it. The API won't start without one. Every endpoint except `/healthz` needs `Authorization: Bearer <key>`.
+- **Address:** the default `127.0.0.1` is reachable only from this machine. In a container, use `--host 0.0.0.0` so other containers on the same network can reach it; the key still applies.
+- **Docs:** `/docs` and `/redoc` are off unless you pass `--docs`. `/openapi.json` always describes the contract.
+- **Config (optional):** `"api": {"key_file": "…", "calls_per_hour": 30, "cache_seconds": 600}`.
+- **Protecting the account:**
+  - each account allows at most `calls_per_hour` Facebook calls in any rolling hour, then answers `429` with `Retry-After`;
+  - an identical request within `cache_seconds` gets the cached answer and doesn't load Facebook again;
+  - every call runs in its own worker process, waits at most 15 seconds for the profile (the watcher's scans share it), and is killed with its browser after 120 seconds (fetch) or 90 seconds (check).
+- **Privacy:** `/fetch-post` uses `public_only: true` unless the request sets it to `false`, so posts from private groups aren't returned. A group counts as public only if its page says "Public group" or "Nhóm Công khai".
+- **Logs:** method, path, status and duration only.
+
+| Endpoint | Request | Response |
+|---|---|---|
+| `GET /healthz` | (no key) | `{"status": "ok"}` |
+| `POST /fetch-post` | `{"url": "…", "account": null, "public_only": true}` | The schema-1 object from "Fetch one post" |
+| `POST /check-group` | `{"url": "<group link or ID>", "account": null}` | `{"name", "visibility": "public" \| "private" \| "unavailable", "note", "group_id"}` |
+| `GET /status` | | `{"accounts": [{"name", "state": "ok" \| "paused" \| "unknown", "reason", "last_round"}], "groups": [{"account", "group_id", "name", "last_ok", "error", "failed_rounds", "failing_since", "incomplete_rounds"}], "deliveries": {"pending", "failing"}}` |
+
+`/status` is read from what `watcher.py run` saves each round (error types only, never post text, cookies, proxies or tokens). It shows `unknown` until the watcher has run a round on this version.
+
+Errors always come back as `{"schema": 1, "error": "<kind>", "message": "…"}`:
+
+| HTTP | `error` |
+|---|---|
+| 400 | `bad_url`, `bad_account`, `bad_request` |
+| 401 | `unauthorized` |
+| 403 | `not_public` |
+| 404 | `not_visible` |
+| 429 | `rate_limited` (with `Retry-After`) |
+| 502 | `error` |
+| 503 | `login_required`, `profile_busy` (with `Retry-After`) |
+| 504 | `timeout` |
+
+```bash
+curl -s -X POST http://127.0.0.1:8091/fetch-post \
+  -H "Authorization: Bearer $(cat ~/.config/fb-watcher/api.key)" -H "Content-Type: application/json" \
+  -d '{"url": "https://www.facebook.com/groups/<group>/posts/<post>/"}'
+```
+
+**In Docker (optional):** the image already includes the API. To run it, start the container with the command `api --host 0.0.0.0 --port 8091` and mount the key file. braveduck's `deploy/hosted` files aren't changed here.
 
 ## Tests
 
 ```bash
 .venv/bin/python tests/test_run_loop.py     # run loop, outbox, boundary, scan worker; no Facebook
 .venv/bin/python tests/test_fetch_post.py   # fetch-post arguments, URLs, exit codes; no Facebook
+.venv/bin/python tests/test_api.py          # HTTP API with fakes; no Facebook
 ```

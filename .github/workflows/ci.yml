@@ -17,14 +17,16 @@ jobs:
         with:
           python-version: "3.12"
       - name: syntax
-        run: python -m py_compile watcher.py fbn_patch.py braveduck_service.py fetch_post.py
+        run: python -m py_compile watcher.py fbn_patch.py braveduck_service.py fetch_post.py api.py
       - name: braveduck service tests
         run: python -m unittest test_braveduck_service -v
       - name: install fbn and Chromium
-        run: pip install -r requirements.txt && python -m playwright install --with-deps chromium
+        run: pip install -r requirements-dev.txt && python -m playwright install --with-deps chromium
       - name: run loop tests (no Facebook)
         run: python tests/test_run_loop.py
       - name: fetch-post tests (no Facebook)
         run: python tests/test_fetch_post.py
+      - name: HTTP API tests (no Facebook)
+        run: python tests/test_api.py
       - name: image
         run: docker build -t fb-watcher .
