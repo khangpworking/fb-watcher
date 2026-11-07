@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 import watcher  # sets up Chromium's libs before Playwright starts it
 import dateparser
+import fbn.mobile as mobile
 from fbn.exceptions import ProfileInUseError
 from fbn.extractor import parse_group_ref, parse_post_url
 from playwright.sync_api import Error as PlaywrightError
@@ -36,7 +37,7 @@ EXIT_NOT_VISIBLE = 4  # post deleted, not visible to this account, or group not 
 EXIT_BUSY = 5         # the account's browser profile stayed busy (the watcher is scanning)
 EXIT_NOT_PUBLIC = 6   # with public_only: the post's group isn't a confirmed public group
 
-VISIBILITY_MAX_AGE = 24 * 3600  # reuse a group's checked visibility for a day
+VISIBILITY_MAX_AGE = 3600  # reuse a group's checked public/private answer for an hour
 
 LOCK_WAIT_SECONDS = 240
 PAGE_TIMEOUT_SECONDS = 45
@@ -86,7 +87,11 @@ class FetchError(Exception):
 
 
 def _supported_url(url):
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+        parts.port
+    except ValueError:
+        return False
     host = (parts.hostname or "").lower()
     if parts.scheme != "https" or host not in ("facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"):
         return False
@@ -201,23 +206,114 @@ class _ProfileLock:
         return self.held.__exit__(*exc)
 
 
-def _check_visibility(acct, group_key, headless):
-    """Group visibility via braveduck_service.check_group, cached for a day in seen.db.
-    The caller holds the profile lock and has no Playwright running in this thread."""
+_HEADER_LABEL = re.compile(
+    r"(public group|private group|nhóm công khai|nhóm riêng tư)\s*·\s*[\d.,]+\s*[kmn]?\S*\s*(members|thành viên)",
+    re.IGNORECASE)
+_UNAVAILABLE = ("this content isn't available", "nội dung này hiện không hiển thị", "this page isn't available",
+                "trang này hiện không hiển thị")
+_OWN_ID = [r"fb://group/(?:\?id=)?{id}\b", r'"groupID":"{id}"', r'"group_id":"{id}"']
+
+
+def classify_group_page(final_url, title, header_text, html, group_key):
+    """Strict visibility for a group page: (visibility, note, numeric_id).
+
+    Public only when the page is this group's own page (URL and an ID the page itself
+    names) and its header reads "<Public group> · <N> members" before anything else that
+    looks like a privacy label. Login/checkpoint pages raise; anything unclear is
+    'unavailable', so a mistake can only hide a group, never expose one."""
     import braveduck_service as bds
 
-    db = watcher.open_db()
-    row = db.execute("SELECT name, visibility, note, numeric_id, checked_at FROM group_visibility WHERE group_key = ?",
-                     (group_key,)).fetchone()
-    if row and time.time() - row[4] < VISIBILITY_MAX_AGE:
-        name, vis, note, numeric = row[:4]
-    else:
-        name, vis, note, numeric = bds.check_group(acct["profile"], acct.get("proxy"),
-                                                   f"https://m.facebook.com/groups/{group_key}/", group_key, headless)
-        with db:
-            db.execute("INSERT OR REPLACE INTO group_visibility VALUES (?, ?, ?, ?, ?, ?)",
-                       (group_key, name, vis, note, numeric, int(time.time())))
-    db.close()
+    path = urlsplit(final_url).path
+    if "/login" in path or "/checkpoint" in path:
+        raise FetchError(EXIT_LOGIN, "login_required", "the account isn't logged in or needs an account check")
+    text = (header_text or "").lower()
+    if any(marker in text for marker in _UNAVAILABLE):
+        return "unavailable", "group page isn't available to this account", None
+    if not path.startswith("/groups/"):
+        return "unavailable", "didn't land on the group's page", None
+    numeric = group_key if group_key.isdecimal() else bds.parse_group_id(html, group_key)
+    if not numeric or not any(re.search(p.format(id=re.escape(numeric)), html or "") for p in _OWN_ID):
+        return "unavailable", "couldn't confirm this is the group's own page", None
+    name = bds.parse_name(title).lower()
+    start = text.find(name) if name else -1
+    match = _HEADER_LABEL.search(text, max(start, 0))
+    if not match or (start >= 0 and match.start() - start > 400):
+        return "unavailable", "couldn't read the group's privacy label", numeric
+    vis = "public" if match.group(1).lower() in ("public group", "nhóm công khai") else "private"
+    return vis, "", numeric
+
+
+def _db():
+    """seen.db for the visibility cache; tables are created by `watcher.py run`/`api`."""
+    import sqlite3
+
+    db = sqlite3.connect(watcher.DB_PATH, timeout=10)
+    db.execute("""CREATE TABLE IF NOT EXISTS group_visibility (
+        group_key TEXT PRIMARY KEY, name TEXT, visibility TEXT NOT NULL, note TEXT NOT NULL,
+        numeric_id TEXT, checked_at INTEGER NOT NULL)""")
+    return db
+
+
+def _guard_navigation(context):
+    """Abort any navigation that leaves facebook.com (redirects included)."""
+    def guard(route):
+        if route.request.is_navigation_request() and not mobile._trusted_url(route.request.url):
+            route.abort()
+        else:
+            route.fallback()
+    context.route("**/*", guard)
+
+
+def _load_group_page(acct, group_key, headless):
+    """Open the group's page the way braveduck_service.check_group does (the path the
+    scanner uses live) and return what classify_group_page needs."""
+    import braveduck_service as bds
+
+    options = {"headless": headless}
+    if acct.get("proxy"):
+        options["proxy"] = acct["proxy"]
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(str(acct["profile"]), **options)
+        try:
+            _guard_navigation(ctx)
+            page = ctx.new_page()
+            page.goto(f"https://m.facebook.com/groups/{group_key}/", wait_until="domcontentloaded",
+                      timeout=PAGE_TIMEOUT_SECONDS * 1000)
+            page.wait_for_timeout(3000)  # the header renders after load
+            if page.locator('input[name="pass"]').count():
+                raise FetchError(EXIT_LOGIN, "login_required", "the account isn't logged in or needs an account check")
+            main = page.locator('[role="main"]')
+            surface = main.first if main.count() else page.locator("body").first
+            text = surface.inner_text(timeout=10_000)[:bds.HEADER_CHARS]
+            return page.url, page.title(), text, page.content()
+        finally:
+            ctx.close()
+
+
+def _check_visibility(acct, group_key, headless, max_age=VISIBILITY_MAX_AGE):
+    """Strict group visibility, reusing a public/private answer younger than max_age.
+    The caller holds the profile lock and has no Playwright running in this thread.
+    Unclear answers aren't cached, and login problems raise instead of being remembered."""
+    import braveduck_service as bds
+
+    db = _db()
+    try:
+        row = db.execute("SELECT name, visibility, note, numeric_id, checked_at FROM group_visibility "
+                         "WHERE group_key = ?", (group_key,)).fetchone()
+        if row and row[1] in ("public", "private") and time.time() - row[4] < max_age:
+            name, vis, note, numeric = row[:4]
+        else:
+            final_url, title, text, html = _load_group_page(acct, group_key, headless)
+            vis, note, numeric = classify_group_page(final_url, title, text, html, group_key)
+            name = bds.parse_name(title) or None
+            with db:
+                if vis in ("public", "private"):
+                    db.execute("INSERT OR REPLACE INTO group_visibility VALUES (?, ?, ?, ?, ?, ?)",
+                               (group_key, name, vis, note, numeric, int(time.time())))
+                else:
+                    db.execute("DELETE FROM group_visibility WHERE group_key = ?", (group_key,))
+    finally:
+        db.close()
     return {"name": name, "visibility": vis, "note": note,
             "group_id": numeric or (group_key if group_key.isdecimal() else None)}
 
@@ -226,7 +322,7 @@ def check_group(url, account=None, *, lock_wait=LOCK_WAIT_SECONDS, headless=True
     """Name and visibility of a group: {name, visibility: public|private|unavailable, note,
     group_id}. Only an explicit "Public group"/"Nhóm Công khai" counts as public. Raises FetchError."""
     try:
-        group_key = parse_group_ref(url).key
+        group_key = parse_group_ref(url.strip()).key
     except Exception:
         raise FetchError(EXIT_USAGE, "bad_url", "not a Facebook group link or ID") from None
     try:
@@ -236,7 +332,7 @@ def check_group(url, account=None, *, lock_wait=LOCK_WAIT_SECONDS, headless=True
     source = watcher.make_source(acct, headless)
     with _ProfileLock(source, source._prepare_profile(), lock_wait):
         try:
-            return _check_visibility(acct, group_key, headless)
+            return _check_visibility(acct, group_key, headless, max_age)
         except PlaywrightError as e:
             raise FetchError(EXIT_ERROR, "error", f"{type(e).__name__}: {str(e).splitlines()[0][:200]}") from e
 
@@ -267,6 +363,7 @@ def fetch_post(url, account=None, *, assets_dir=None, lock_wait=LOCK_WAIT_SECOND
                     str(profile_dir), headless=headless, viewport={"width": 1280, "height": 900},
                     timezone_id=tz_name, accept_downloads=False, **options)
                 try:
+                    _guard_navigation(context)
                     post = _read_post(context, url, tz_name)
                 finally:
                     context.close()

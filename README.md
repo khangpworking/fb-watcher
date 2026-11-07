@@ -205,21 +205,28 @@ A small HTTP API, so other services (for example braveduck's Go server, in anoth
 .venv/bin/python watcher.py api [--host 127.0.0.1] [--port 8091] [--docs]
 ```
 
-- **Key:** required. Put a random key of at least 16 characters in a file (`head -c 32 /dev/urandom | base64 > ~/.config/fb-watcher/api.key; chmod 600 …`), then point `FB_WATCHER_API_KEY_FILE`, or `api.key_file` in the config, at it. The API won't start without one. Every endpoint except `/healthz` needs `Authorization: Bearer <key>`.
+- **Key:** required. Put a random key of at least 16 characters in a file (`head -c 32 /dev/urandom | base64 > ~/.config/fb-watcher/api.key; chmod 600 …`), then point `FB_WATCHER_API_KEY_FILE`, or `api.key_file` in the config, at it. The API won't start without one. Every endpoint except `/healthz` and `/openapi.json` needs `Authorization: Bearer <key>`. The key is checked before the request body is read.
+- **Requests:** POST bodies must send `Content-Length` (Go's HTTP client does) and be at most 16 KB. Unknown fields are refused.
 - **Address:** the default `127.0.0.1` is reachable only from this machine. In a container, use `--host 0.0.0.0` so other containers on the same network can reach it; the key still applies.
-- **Docs:** `/docs` and `/redoc` are off unless you pass `--docs`. `/openapi.json` always describes the contract.
+- **Docs:** `/docs` and `/redoc` are off unless you pass `--docs`. `/openapi.json` is always open and describes the contract, including bearer auth and the error responses; it holds no secrets.
 - **Config (optional):** `"api": {"key_file": "…", "calls_per_hour": 30, "cache_seconds": 600}`.
 - **Protecting the account:**
+  - each account runs one browser job at a time; a second request waits up to 15 seconds, then gets `503 profile_busy`. Identical requests that arrive together share the first one's answer;
   - each account allows at most `calls_per_hour` Facebook calls in any rolling hour, then answers `429` with `Retry-After`;
-  - an identical request within `cache_seconds` gets the cached answer and doesn't load Facebook again;
-  - every call runs in its own worker process, waits at most 15 seconds for the profile (the watcher's scans share it), and is killed with its browser after 120 seconds (fetch) or 90 seconds (check).
-- **Privacy:** `/fetch-post` uses `public_only: true` unless the request sets it to `false`, so posts from private groups aren't returned. A group counts as public only if its page says "Public group" or "Nhóm Công khai".
-- **Logs:** method, path, status and duration only.
+  - the same post (however it's linked: `m.`/`www.`, `/permalink/` or `/posts/`, tracking parameters) within `cache_seconds` gets the cached answer and doesn't load Facebook again;
+  - an account the watcher has paused (logged out, account check) is refused with `503 login_required`. After the API itself hits a login problem, that account rests for 30 minutes;
+  - every call runs in its own worker process and waits at most 15 seconds for the profile, which the watcher's scans share. It's killed after 120 seconds (fetch) or 90 seconds (check), together with every browser process it started.
+- **Privacy:** `/fetch-post` only returns posts from groups confirmed public, and callers can't turn that off. A group counts as public only when:
+  - its own page loads (not a login, checkpoint or "unavailable" page) and names the group's own ID;
+  - its header reads "Public group · N members" (or "Nhóm Công khai · N thành viên").
+
+  Anything unclear counts as not public. A public or private answer is reused for an hour; unclear answers and login problems aren't remembered. When `/check-group` finds a group isn't public, cached posts from it are dropped.
+- **Logs:** method, path, status and duration only. Errors are caught before the server logs them, and workers' browser output is discarded.
 
 | Endpoint | Request | Response |
 |---|---|---|
 | `GET /healthz` | (no key) | `{"status": "ok"}` |
-| `POST /fetch-post` | `{"url": "…", "account": null, "public_only": true}` | The schema-1 object from "Fetch one post" |
+| `POST /fetch-post` | `{"url": "…", "account": null}` | The schema-1 object from "Fetch one post" |
 | `POST /check-group` | `{"url": "<group link or ID>", "account": null}` | `{"name", "visibility": "public" \| "private" \| "unavailable", "note", "group_id"}` |
 | `GET /status` | | `{"accounts": [{"name", "state": "ok" \| "paused" \| "unknown", "reason", "last_round"}], "groups": [{"account", "group_id", "name", "last_ok", "error", "failed_rounds", "failing_since", "incomplete_rounds"}], "deliveries": {"pending", "failing"}}` |
 
@@ -230,13 +237,18 @@ Errors always come back as `{"schema": 1, "error": "<kind>", "message": "…"}`:
 | HTTP | `error` |
 |---|---|
 | 400 | `bad_url`, `bad_account`, `bad_request` |
-| 401 | `unauthorized` |
+| 401 | `unauthorized` (with `WWW-Authenticate: Bearer`) |
 | 403 | `not_public` |
-| 404 | `not_visible` |
+| 404 | `not_visible`, or `not_found` for an unknown path |
+| 405 | `method_not_allowed` (with `Allow`) |
+| 411 | `length_required` |
+| 413 | `too_large` |
 | 429 | `rate_limited` (with `Retry-After`) |
 | 502 | `error` |
-| 503 | `login_required`, `profile_busy` (with `Retry-After`) |
+| 503 | `login_required`, `profile_busy` (both with `Retry-After`) |
 | 504 | `timeout` |
+
+Times are ISO 8601: `published_at` and `fetched_at` carry an offset; `/status` times are UTC (`…Z`). IDs are strings. Fields shown as `null` in the schema are always present.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8091/fetch-post \

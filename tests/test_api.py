@@ -1,9 +1,11 @@
 """HTTP API checks with FastAPI's TestClient; no Facebook, no network.
 Run: .venv/bin/python tests/test_api.py"""
 import json
-import sqlite3
+import os
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -70,14 +72,26 @@ def auth_missing_wrong_and_right_key():
 
 
 @case
-def fetch_post_returns_schema_1_and_defaults_to_public_only():
+def fetch_post_returns_schema_1():
     fake = Fake()
     r = client(fake).post("/fetch-post", json={"url": POST["url"]}, headers=AUTH)
     assert r.status_code == 200 and r.json() == POST, r.text
     api.FetchPostResponse.model_validate(r.json())
     kind, request, timeout = fake.calls[0]
-    assert kind == "fetch" and request == {"url": POST["url"], "account": "default", "public_only": True}
+    assert kind == "fetch" and request == {"url": POST["url"], "account": "default"}
     assert timeout == api.FETCH_TIMEOUT
+
+
+@case
+def callers_cant_turn_off_public_only():
+    fake = Fake()
+    r = client(fake).post("/fetch-post", json={"url": POST["url"], "public_only": False}, headers=AUTH)
+    assert r.status_code == 400 and r.json()["error"] == "bad_request" and not fake.calls, r.text
+    calls = []
+    with patch("fetch_post.fetch_post", side_effect=lambda *a, **k: calls.append(k) or POST), \
+            patch.object(sys, "stdin", type("I", (), {"read": lambda self: json.dumps({"kind": "fetch", "url": POST["url"], "public_only": False})})()):
+        api.cmd_api_worker()
+    assert calls and calls[0]["public_only"] is True, calls
 
 
 @case
@@ -97,7 +111,7 @@ def each_error_kind_maps_to_its_status_with_error_body():
         r = client(Fake(api.ApiError(kind, "m", retry))).post("/fetch-post", json={"url": POST["url"]}, headers=AUTH)
         assert r.status_code == status, (kind, r.status_code)
         assert r.json() == {"schema": 1, "error": kind, "message": "m"}, (kind, r.text)
-        assert (r.headers.get("retry-after") == "30") == (kind == "profile_busy"), (kind, r.headers)
+        assert ("retry-after" in r.headers) == (kind in ("profile_busy", "login_required")), (kind, r.headers)
 
 
 @case
@@ -107,8 +121,97 @@ def unknown_account_and_bad_body_are_400():
     assert r.status_code == 400 and r.json()["error"] == "bad_account", r.text
     r = c.post("/fetch-post", json={"nope": 1}, headers=AUTH)
     assert r.status_code == 400 and r.json()["error"] == "bad_request", r.text
-    r = c.post("/fetch-post", content="not json", headers={**AUTH, "Content-Type": "application/json"})
-    assert r.status_code == 400, r.text
+    for body in (b"not json", b"\xff\xfe{", b'{"url": 5}'):
+        r = c.post("/fetch-post", content=body, headers={**AUTH, "Content-Type": "application/json"})
+        assert r.status_code == 400 and r.json()["schema"] == 1, (body, r.status_code, r.text)
+    r = c.post("/fetch-post", json={"url": "x" * 3000}, headers=AUTH)
+    assert r.status_code == 400 and r.json()["error"] == "bad_request", r.text
+
+
+@case
+def unknown_routes_methods_and_big_bodies_use_the_error_shape():
+    c = client()
+    r = c.get("/nope", headers=AUTH)
+    assert r.status_code == 404 and r.json()["error"] == "not_found", r.text
+    r = c.get("/fetch-post", headers=AUTH)
+    assert r.status_code == 405 and r.json()["error"] == "method_not_allowed" and "allow" in r.headers, r.text
+    big = json.dumps({"url": POST["url"], "account": "x" * 20000})
+    r = c.post("/fetch-post", content=big, headers={**AUTH, "Content-Type": "application/json"})
+    assert r.status_code == 413 and r.json()["error"] == "too_large", r.text
+    r = c.post("/fetch-post", content=big, headers={"Content-Type": "application/json"})
+    assert r.status_code == 401, "anonymous requests are refused before the body is read"
+
+
+@case
+def same_post_linked_differently_is_fetched_once():
+    fake = Fake()
+    c = client(fake)
+    for url in (POST["url"], "https://m.facebook.com/groups/1/permalink/2/?__cft__=x",
+                "https://web.facebook.com/groups/1/posts/2/#c"):
+        assert c.post("/fetch-post", json={"url": url}, headers=AUTH).status_code == 200
+    assert len(fake.calls) == 1, fake.calls
+
+
+@case
+def concurrent_identical_requests_run_one_browser_job():
+    started = []
+
+    def slow(kind, request, timeout):
+        started.append(time.monotonic())
+        time.sleep(0.5)
+        return POST
+    c = client(slow)
+    codes = []
+    threads = [threading.Thread(target=lambda: codes.append(
+        c.post("/fetch-post", json={"url": POST["url"]}, headers=AUTH).status_code)) for _ in range(4)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert codes == [200] * 4 and len(started) == 1, (codes, started)
+
+
+@case
+def paused_account_and_login_problem_stop_further_calls():
+    db_path = TMP / "paused.db"
+    with patch.object(watcher, "DB_PATH", db_path):
+        db = watcher.open_db()
+        watcher.write_status(db, [{"name": "second"}], {"second": "AccountActionRequiredError on account second"}, {})
+    fake = Fake()
+    r = client(fake, db_path=db_path).post("/fetch-post", json={"url": POST["url"], "account": "second"}, headers=AUTH)
+    assert r.status_code == 503 and r.json()["error"] == "login_required" and "retry-after" in r.headers, r.text
+    assert not fake.calls
+    now = [0.0]
+    fake = Fake(api.ApiError("login_required", "logged out"))
+    c = client(fake, clock=lambda: now[0], cache_seconds=0)
+    assert c.post("/fetch-post", json={"url": POST["url"]}, headers=AUTH).status_code == 503
+    r = c.post("/fetch-post", json={"url": POST["url"] + "?x"}, headers=AUTH)
+    assert r.status_code == 503 and len(fake.calls) == 1, (r.text, fake.calls)
+    now[0] = api.LOGIN_RETRY_AFTER_SECONDS + 1
+    assert c.post("/fetch-post", json={"url": POST["url"]}, headers=AUTH).status_code == 200
+
+
+@case
+def private_check_drops_cached_posts_of_that_group():
+    fake = Fake(POST, {"name": "G", "visibility": "private", "note": "", "group_id": "1"}, POST)
+    c = client(fake)
+    c.post("/fetch-post", json={"url": POST["url"]}, headers=AUTH)
+    c.post("/check-group", json={"url": "1"}, headers=AUTH)
+    c.post("/fetch-post", json={"url": POST["url"]}, headers=AUTH)
+    assert [k for k, _, _ in fake.calls] == ["fetch", "check", "fetch"], fake.calls
+
+
+@case
+def unexpected_worker_result_is_502_and_never_logged():
+    lines = []
+    handler = type("H", (api.logging.Handler,), {"emit": lambda self, rec: lines.append(rec.getMessage())})()
+    root = api.logging.getLogger()
+    root.addHandler(handler)
+    try:
+        bad = {k: v for k, v in POST.items() if k != "group_id"} | {"text": "PRIVATE TEXT"}
+        r = client(Fake(bad)).post("/fetch-post", json={"url": POST["url"]}, headers=AUTH)
+    finally:
+        root.removeHandler(handler)
+    assert r.status_code == 502 and r.json()["error"] == "error" and "PRIVATE" not in r.text, r.text
+    assert not any("PRIVATE TEXT" in line for line in lines), lines
 
 
 @case
@@ -159,10 +262,10 @@ def status_reports_health_and_leaks_no_secrets():
     db_path = TMP / "status.db"
     with patch.object(watcher, "DB_PATH", db_path):
         db = watcher.open_db()
-    db.execute("INSERT INTO account_status VALUES ('default', 'ok', '', ?)", (int(time.time()),))
-    db.execute("INSERT INTO account_status VALUES ('second', 'paused', 'AuthenticationRequiredError on account second', 1)")
     db.execute("INSERT INTO group_status VALUES ('default', '101', 'G', ?, '', 0, '')", (int(time.time()),))
-    db.execute("INSERT INTO group_status VALUES ('second', '202', 'H', NULL, 'LayoutChangedError', 4, '10:00')")
+    watcher.write_status(db, [{"name": "default"}, {"name": "second"}],
+                         {"second": "AuthenticationRequiredError on account second"},
+                         {("second", "202"): ("H", "10:00", 4, "LayoutChangedError")})
     db.execute("INSERT INTO group_state (group_id, initialized, incomplete) VALUES ('101', 1, 2)")
     secret_post = {"post": {"text": "SECRET POST TEXT", "url": "https://x/?__cft__=TRACK"}}
     db.execute("INSERT INTO outbox VALUES ('101:9', 'braveduck', ?, 5, 0)", (json.dumps(secret_post),))
@@ -194,6 +297,10 @@ def docs_off_unless_asked_and_openapi_documents_contract():
     assert set(spec["paths"]) == {"/healthz", "/fetch-post", "/check-group", "/status"}, spec["paths"].keys()
     props = spec["components"]["schemas"]["FetchPostResponse"]["properties"]
     assert "schema" in props and "text" in props
+    op = spec["paths"]["/fetch-post"]["post"]
+    assert op["security"] == [{"HTTPBearer": []}] and "422" not in op["responses"], op
+    assert "HTTPValidationError" not in spec["components"]["schemas"]
+    assert "public_only" not in spec["components"]["schemas"]["FetchPostRequest"]["properties"]
 
 
 @case
@@ -234,6 +341,30 @@ def logs_have_no_body_or_query():
         api.log.removeHandler(handler)
     assert lines and lines[-1].startswith("POST /fetch-post 200"), lines
     assert not any(s in " ".join(lines) for s in ("QUERYSECRET", "__cft__", KEY, "AI job")), lines
+
+
+@case
+def timed_out_worker_leaves_no_chromium_behind():
+    profile = TMP / "kill-profile"
+    script = TMP / "hang_browser.py"
+    script.write_text(
+        "import sys, time\n"
+        f"sys.path.insert(0, {str(watcher.ROOT)!r})\n"
+        "import watcher\n"
+        "from playwright.sync_api import sync_playwright\n"
+        "p = sync_playwright().start()\n"
+        f"p.chromium.launch_persistent_context({str(profile)!r}, headless=True)\n"
+        "time.sleep(600)\n")
+    real = subprocess.Popen
+    with patch.object(watcher.subprocess, "Popen", lambda args, **kw: real([sys.executable, str(script)], **kw)):
+        try:
+            watcher.call_worker("api-worker", {}, 8)
+            raise AssertionError("no timeout")
+        except watcher.WorkerTimeout:
+            pass
+    time.sleep(1)
+    left = subprocess.run(["pgrep", "-f", str(profile)], capture_output=True, text=True).stdout.split()
+    assert not left, f"Chromium still running: {left}"
 
 
 for status, name, err in results:

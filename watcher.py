@@ -404,18 +404,67 @@ class WorkerTimeout(ScanWorkerError):
     """A worker ran past its time limit and was killed with its browser."""
 
 
-def call_worker(command, request, timeout):
+def _descendants(pid):
+    """All processes under pid, from /proc. Playwright starts Chromium in its own process
+    group, so killing the worker's group alone would leave the browser running."""
+    children = {}
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            try:
+                with open(f"/proc/{entry}/stat") as f:
+                    ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, IndexError, ValueError):
+                continue
+            children.setdefault(ppid, []).append(int(entry))
+    found, todo = [], [pid]
+    while todo:
+        for child in children.get(todo.pop(), []):
+            found.append(child)
+            todo.append(child)
+    return found
+
+
+def kill_tree(proc):
+    """Kill a worker and everything it started. Children die first, so the worker keeps the
+    profile lock until its browser is gone."""
+    tree = _descendants(proc.pid)
+    for pid in reversed(tree):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+    deadline = time.monotonic() + 5
+    while any(os.path.exists(f"/proc/{pid}") and not _zombie(pid) for pid in tree) and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+
+def _zombie(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        return True
+
+
+def call_worker(command, request, timeout, quiet=False):
     """Run `watcher.py <command>` in its own process group with `request` as JSON on stdin;
-    return its one-line JSON reply. On timeout, kill it and every Chromium it started."""
+    return its one-line JSON reply. On timeout, kill it and every process it started.
+    quiet: drop the worker's stderr (browser and fbn logs), for callers whose logs must
+    never carry page details."""
     worker = subprocess.Popen(
         [sys.executable, "-u", str(ROOT / "watcher.py"), command],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, start_new_session=True,
+        stderr=subprocess.DEVNULL if quiet else None,
     )
     try:
         out, _ = worker.communicate(json.dumps(request), timeout=timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(worker.pid, signal.SIGKILL)
-        worker.wait()
+        kill_tree(worker)
         raise WorkerTimeout(f"{command} took longer than {timeout}s and was stopped") from None
     try:
         return json.loads(out.strip().splitlines()[-1])
