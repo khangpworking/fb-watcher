@@ -206,41 +206,15 @@ class _ProfileLock:
         return self.held.__exit__(*exc)
 
 
-_HEADER_LABEL = re.compile(
-    r"(public group|private group|nhóm công khai|nhóm riêng tư)\s*·\s*[\d.,]+\s*[kmn]?\S*\s*(members|thành viên)",
-    re.IGNORECASE)
-_UNAVAILABLE = ("this content isn't available", "nội dung này hiện không hiển thị", "this page isn't available",
-                "trang này hiện không hiển thị")
-_OWN_ID = [r"fb://group/(?:\?id=)?{id}\b", r'"groupID":"{id}"', r'"group_id":"{id}"']
-
-
 def classify_group_page(final_url, title, header_text, html, group_key):
-    """Strict visibility for a group page: (visibility, note, numeric_id).
-
-    Public only when the page is this group's own page (URL and an ID the page itself
-    names) and its header reads "<Public group> · <N> members" before anything else that
-    looks like a privacy label. Login/checkpoint pages raise; anything unclear is
-    'unavailable', so a mistake can only hide a group, never expose one."""
+    """braveduck_service.classify_group_page, with login problems as FetchError."""
     import braveduck_service as bds
+    from fbn.exceptions import AuthenticationRequiredError
 
-    path = urlsplit(final_url).path
-    if "/login" in path or "/checkpoint" in path:
-        raise FetchError(EXIT_LOGIN, "login_required", "the account isn't logged in or needs an account check")
-    text = (header_text or "").lower()
-    if any(marker in text for marker in _UNAVAILABLE):
-        return "unavailable", "group page isn't available to this account", None
-    if not path.startswith("/groups/"):
-        return "unavailable", "didn't land on the group's page", None
-    numeric = group_key if group_key.isdecimal() else bds.parse_group_id(html, group_key)
-    if not numeric or not any(re.search(p.format(id=re.escape(numeric)), html or "") for p in _OWN_ID):
-        return "unavailable", "couldn't confirm this is the group's own page", None
-    name = bds.parse_name(title).lower()
-    start = text.find(name) if name else -1
-    match = _HEADER_LABEL.search(text, max(start, 0))
-    if not match or (start >= 0 and match.start() - start > 400):
-        return "unavailable", "couldn't read the group's privacy label", numeric
-    vis = "public" if match.group(1).lower() in ("public group", "nhóm công khai") else "private"
-    return vis, "", numeric
+    try:
+        return bds.classify_group_page(final_url, title, header_text, html, group_key)
+    except AuthenticationRequiredError:
+        raise FetchError(EXIT_LOGIN, "login_required", "the account isn't logged in or needs an account check") from None
 
 
 def _db():
@@ -265,29 +239,14 @@ def _guard_navigation(context):
 
 
 def _load_group_page(acct, group_key, headless):
-    """Open the group's page the way braveduck_service.check_group does (the path the
-    scanner uses live) and return what classify_group_page needs."""
     import braveduck_service as bds
+    from fbn.exceptions import AuthenticationRequiredError
 
-    options = {"headless": headless}
-    if acct.get("proxy"):
-        options["proxy"] = acct["proxy"]
-    with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(str(acct["profile"]), **options)
-        try:
-            _guard_navigation(ctx)
-            page = ctx.new_page()
-            page.goto(f"https://m.facebook.com/groups/{group_key}/", wait_until="domcontentloaded",
-                      timeout=PAGE_TIMEOUT_SECONDS * 1000)
-            page.wait_for_timeout(3000)  # the header renders after load
-            if page.locator('input[name="pass"]').count():
-                raise FetchError(EXIT_LOGIN, "login_required", "the account isn't logged in or needs an account check")
-            main = page.locator('[role="main"]')
-            surface = main.first if main.count() else page.locator("body").first
-            text = surface.inner_text(timeout=10_000)[:bds.HEADER_CHARS]
-            return page.url, page.title(), text, page.content()
-        finally:
-            ctx.close()
+    try:
+        return bds.load_group_page(acct["profile"], acct.get("proxy"), group_key, headless,
+                                   PAGE_TIMEOUT_SECONDS * 1000)
+    except AuthenticationRequiredError:
+        raise FetchError(EXIT_LOGIN, "login_required", "the account isn't logged in or needs an account check") from None
 
 
 def _check_visibility(acct, group_key, headless, max_age=VISIBILITY_MAX_AGE):

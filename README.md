@@ -130,9 +130,11 @@ python watcher.py serve-braveduck
 Each round it asks braveduck which groups are followed, opens each new group's
 page once a day to read its name and whether it's a **public** group, scans
 public groups, and hands their new posts to braveduck, which matches them to
-each person's own search terms. A group counts as public only when its page
-says "Public group" (or "Nhóm Công khai"); private groups and unclear ones are
-reported and never scanned for others, since their posts are for members.
+each person's own search terms. A group counts as public only when it's the group's own
+page (its own ID, not a login, checkpoint or "unavailable" page) and its header
+reads "Public group · N members" (or "Nhóm Công khai · N thành viên"); private
+groups and unclear ones are reported and never scanned for others, since their
+posts are for members. The same check guards the HTTP API.
 
 Config: `braveduck_service` in `config.json`, or the environment (the
 Dockerfile sets these, and needs no `config.json`):

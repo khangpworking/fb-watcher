@@ -97,6 +97,10 @@ def group_is_public_only_with_its_own_header_label():
     assert c(URL, "Jobs | Facebook", "Jobs\nPublic group · 33K members\nInvite", HTML, "123") == ("public", "", "123")
     assert c(URL, "Jobs", "Jobs\nNhóm Công khai · 2,5K thành viên", HTML, "123")[0] == "public"
     assert c(URL, "Jobs", "Jobs\nPrivate group · 1.2K members", HTML, "123")[0] == "private"
+    # Header text as Facebook rendered it on 2026-11-07 (separate lines, non-breaking space).
+    live = "Group by Linh Nấu\nViệc làm AI Engineer -Việt Nam\nPublic group\n\xa0\n·\n33.7K members\nInvite\nJoined"
+    assert c("https://www.facebook.com/groups/123/?_rdr", "Việc làm AI Engineer -Việt Nam | Facebook", live, HTML,
+             "123")[0] == "public"
 
 
 @case
