@@ -82,8 +82,60 @@ def busy_profile_waits_then_exits_5():
 
 @case
 def exit_codes_are_distinct():
-    codes = [fp.EXIT_OK, fp.EXIT_ERROR, fp.EXIT_USAGE, fp.EXIT_LOGIN, fp.EXIT_NOT_VISIBLE, fp.EXIT_BUSY]
+    codes = [fp.EXIT_OK, fp.EXIT_ERROR, fp.EXIT_USAGE, fp.EXIT_LOGIN, fp.EXIT_NOT_VISIBLE, fp.EXIT_BUSY,
+             fp.EXIT_NOT_PUBLIC]
     assert len(set(codes)) == len(codes) and fp.EXIT_LOGIN == watcher.EXIT_NEEDS_USER
+
+
+HTML = '<script>"groupID":"123"</script>'
+URL = "https://m.facebook.com/groups/123/"
+
+
+@case
+def group_is_public_only_with_its_own_header_label():
+    c = fp.classify_group_page
+    assert c(URL, "Jobs | Facebook", "Jobs\nPublic group · 33K members\nInvite", HTML, "123") == ("public", "", "123")
+    assert c(URL, "Jobs", "Jobs\nNhóm Công khai · 2,5K thành viên", HTML, "123")[0] == "public"
+    assert c(URL, "Jobs", "Jobs\nPrivate group · 1.2K members", HTML, "123")[0] == "private"
+    # Header text as Facebook rendered it on 2026-11-07 (separate lines, non-breaking space).
+    live = "Group by Linh Nấu\nViệc làm AI Engineer -Việt Nam\nPublic group\n\xa0\n·\n33.7K members\nInvite\nJoined"
+    assert c("https://www.facebook.com/groups/123/?_rdr", "Việc làm AI Engineer -Việt Nam | Facebook", live, HTML,
+             "123")[0] == "public"
+
+
+@case
+def unclear_pages_are_never_public():
+    c = fp.classify_group_page
+    cases = [
+        # An unavailable page that recommends some other public group.
+        (URL, "Facebook", "This content isn't available\nSuggested groups\nX\nPublic group · 3K members", HTML),
+        # The group's name mentions "Public Group" but its header is private.
+        (URL, "Public Group fans", "Public Group fans\nNhóm riêng tư · 900 thành viên", HTML),
+        # The word alone, not the header form.
+        (URL, "Jobs", "Jobs\nThis is a public group for everyone", HTML),
+        # The page doesn't name this group's own ID.
+        (URL, "Jobs", "Jobs\nPublic group · 3K members", '<a href="https://facebook.com/groups/999/">x</a>'),
+        # Redirected somewhere that isn't the group.
+        ("https://m.facebook.com/home.php", "Jobs", "Jobs\nPublic group · 3K members", HTML),
+    ]
+    for args in cases:
+        assert c(*args, "123")[0] != "public", args
+
+
+@case
+def login_page_is_an_error_not_a_cached_answer():
+    for url in ("https://m.facebook.com/login/?next=x", "https://www.facebook.com/checkpoint/1/"):
+        try:
+            fp.classify_group_page(url, "Log in", "", "", "123")
+            raise AssertionError(url)
+        except fp.FetchError as e:
+            assert e.kind == "login_required" and e.code == fp.EXIT_LOGIN
+
+
+@case
+def bad_urls_never_raise():
+    for url in ("https://[", "https://www.facebook.com:99999/groups/1/posts/2/", "", "   "):
+        assert fp._supported_url(url) is False, url
 
 
 for status, name, err in results:

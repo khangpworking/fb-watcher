@@ -2,6 +2,9 @@
 .profile.lock
 .venv/
 __pycache__/
+astra-debug/
+astra-review/
+astra-test/
 config.json
 failure-screenshots/
 libs/
@@ -9,5 +12,3 @@ login-shots/
 profile/
 profiles/
 seen.db
-astra-debug/
-astra-test/

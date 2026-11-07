@@ -20,8 +20,9 @@ from urllib.parse import urlsplit
 
 import watcher  # sets up Chromium's libs before Playwright starts it
 import dateparser
+import fbn.mobile as mobile
 from fbn.exceptions import ProfileInUseError
-from fbn.extractor import parse_post_url
+from fbn.extractor import parse_group_ref, parse_post_url
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
@@ -34,6 +35,9 @@ EXIT_USAGE = 2        # bad arguments or not a supported Facebook group post URL
 EXIT_LOGIN = 3        # account not logged in, or Facebook wants an account check
 EXIT_NOT_VISIBLE = 4  # post deleted, not visible to this account, or group not joined
 EXIT_BUSY = 5         # the account's browser profile stayed busy (the watcher is scanning)
+EXIT_NOT_PUBLIC = 6   # with public_only: the post's group isn't a confirmed public group
+
+VISIBILITY_MAX_AGE = 3600  # reuse a group's checked public/private answer for an hour
 
 LOCK_WAIT_SECONDS = 240
 PAGE_TIMEOUT_SECONDS = 45
@@ -83,7 +87,11 @@ class FetchError(Exception):
 
 
 def _supported_url(url):
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+        parts.port
+    except ValueError:
+        return False
     host = (parts.hostname or "").lower()
     if parts.scheme != "https" or host not in ("facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"):
         return False
@@ -176,9 +184,124 @@ def _read_post(context, url, tz_name):
     }
 
 
-def fetch_post(url, account=None, *, assets_dir=None, lock_wait=LOCK_WAIT_SECONDS, headless=True):
+class _ProfileLock:
+    def __init__(self, source, profile_dir, lock_wait):
+        self.source, self.profile_dir, self.lock_wait, self.held = source, profile_dir, lock_wait, None
+
+    def __enter__(self):
+        give_up = time.monotonic() + self.lock_wait
+        while True:
+            lock = self.source._profile_lock(self.profile_dir)
+            try:
+                lock.__enter__()
+                self.held = lock
+                return self
+            except ProfileInUseError:
+                if time.monotonic() >= give_up:
+                    raise FetchError(EXIT_BUSY, "profile_busy",
+                                     f"account profile still busy after {self.lock_wait}s") from None
+                time.sleep(min(3, max(0.1, give_up - time.monotonic())))
+
+    def __exit__(self, *exc):
+        return self.held.__exit__(*exc)
+
+
+def classify_group_page(final_url, title, header_text, html, group_key):
+    """braveduck_service.classify_group_page, with login problems as FetchError."""
+    import braveduck_service as bds
+    from fbn.exceptions import AuthenticationRequiredError
+
+    try:
+        return bds.classify_group_page(final_url, title, header_text, html, group_key)
+    except AuthenticationRequiredError:
+        raise FetchError(EXIT_LOGIN, "login_required", "the account isn't logged in or needs an account check") from None
+
+
+def _db():
+    """seen.db for the visibility cache; tables are created by `watcher.py run`/`api`."""
+    import sqlite3
+
+    db = sqlite3.connect(watcher.DB_PATH, timeout=10)
+    db.execute("""CREATE TABLE IF NOT EXISTS group_visibility (
+        group_key TEXT PRIMARY KEY, name TEXT, visibility TEXT NOT NULL, note TEXT NOT NULL,
+        numeric_id TEXT, checked_at INTEGER NOT NULL)""")
+    return db
+
+
+def _guard_navigation(context):
+    """Abort any navigation that leaves facebook.com (redirects included)."""
+    def guard(route):
+        if route.request.is_navigation_request() and not mobile._trusted_url(route.request.url):
+            route.abort()
+        else:
+            route.fallback()
+    context.route("**/*", guard)
+
+
+def _load_group_page(acct, group_key, headless):
+    import braveduck_service as bds
+    from fbn.exceptions import AuthenticationRequiredError
+
+    try:
+        return bds.load_group_page(acct["profile"], acct.get("proxy"), group_key, headless,
+                                   PAGE_TIMEOUT_SECONDS * 1000)
+    except AuthenticationRequiredError:
+        raise FetchError(EXIT_LOGIN, "login_required", "the account isn't logged in or needs an account check") from None
+
+
+def _check_visibility(acct, group_key, headless, max_age=VISIBILITY_MAX_AGE):
+    """Strict group visibility, reusing a public/private answer younger than max_age.
+    The caller holds the profile lock and has no Playwright running in this thread.
+    Unclear answers aren't cached, and login problems raise instead of being remembered."""
+    import braveduck_service as bds
+
+    db = _db()
+    try:
+        row = db.execute("SELECT name, visibility, note, numeric_id, checked_at FROM group_visibility "
+                         "WHERE group_key = ?", (group_key,)).fetchone()
+        if row and row[1] in ("public", "private") and time.time() - row[4] < max_age:
+            name, vis, note, numeric = row[:4]
+        else:
+            final_url, title, text, html = _load_group_page(acct, group_key, headless)
+            vis, note, numeric = classify_group_page(final_url, title, text, html, group_key)
+            name = bds.parse_name(title) or None
+            with db:
+                if vis in ("public", "private"):
+                    db.execute("INSERT OR REPLACE INTO group_visibility VALUES (?, ?, ?, ?, ?, ?)",
+                               (group_key, name, vis, note, numeric, int(time.time())))
+                else:
+                    db.execute("DELETE FROM group_visibility WHERE group_key = ?", (group_key,))
+    finally:
+        db.close()
+    return {"name": name, "visibility": vis, "note": note,
+            "group_id": numeric or (group_key if group_key.isdecimal() else None)}
+
+
+def check_group(url, account=None, *, lock_wait=LOCK_WAIT_SECONDS, headless=True, max_age=VISIBILITY_MAX_AGE):
+    """Name and visibility of a group: {name, visibility: public|private|unavailable, note,
+    group_id}. Only an explicit "Public group"/"Nhóm Công khai" counts as public. Raises FetchError."""
+    try:
+        group_key = parse_group_ref(url.strip()).key
+    except Exception:
+        raise FetchError(EXIT_USAGE, "bad_url", "not a Facebook group link or ID") from None
+    try:
+        acct = _account(account)
+    except SystemExit as e:
+        raise FetchError(EXIT_USAGE, "bad_account", str(e)) from None
+    source = watcher.make_source(acct, headless)
+    with _ProfileLock(source, source._prepare_profile(), lock_wait):
+        try:
+            return _check_visibility(acct, group_key, headless, max_age)
+        except PlaywrightError as e:
+            raise FetchError(EXIT_ERROR, "error", f"{type(e).__name__}: {str(e).splitlines()[0][:200]}") from e
+
+
+def fetch_post(url, account=None, *, assets_dir=None, lock_wait=LOCK_WAIT_SECONDS, headless=True,
+               public_only=False):
     """Fetch one group post. `account` is an account name from config (default: the first
-    account) or an account dict from watcher.load_accounts. Raises FetchError."""
+    account) or an account dict from watcher.load_accounts. With public_only, a post whose
+    group isn't a confirmed public group raises FetchError(not_public) and nothing of it is
+    returned. Raises FetchError."""
     if not isinstance(url, str) or not _supported_url(url.strip()):
         raise FetchError(EXIT_USAGE, "bad_url", "not a Facebook group post or share link")
     url = _desktop_url(url.strip())
@@ -190,25 +313,24 @@ def fetch_post(url, account=None, *, assets_dir=None, lock_wait=LOCK_WAIT_SECOND
         else "Asia/Ho_Chi_Minh"
     source = watcher.make_source(acct, headless)  # only for fbn's profile lock
     profile_dir = source._prepare_profile()
-    give_up = time.monotonic() + lock_wait
-    while True:
+    # Holds the profile lock for the whole read; the watcher's scans wait for it.
+    with _ProfileLock(source, profile_dir, lock_wait):
         try:
-            # Holds the profile lock for the whole read; the watcher's scans wait for it.
-            with source._profile_lock(profile_dir), sync_playwright() as pw:
+            with sync_playwright() as pw:
                 options = {"proxy": acct["proxy"]} if acct.get("proxy") else {}
                 context = pw.chromium.launch_persistent_context(
                     str(profile_dir), headless=headless, viewport={"width": 1280, "height": 900},
                     timezone_id=tz_name, accept_downloads=False, **options)
                 try:
+                    _guard_navigation(context)
                     post = _read_post(context, url, tz_name)
                 finally:
                     context.close()
-            break
-        except ProfileInUseError:
-            if time.monotonic() >= give_up:
-                raise FetchError(EXIT_BUSY, "profile_busy",
-                                 f"account profile still busy after {lock_wait}s") from None
-            time.sleep(3)
+            if public_only:
+                group = _check_visibility(acct, post["group_key"], headless)
+                if group["visibility"] != "public":
+                    raise FetchError(EXIT_NOT_PUBLIC, "not_public",
+                                     f"the post's group isn't a confirmed public group ({group['visibility']})")
         except PlaywrightError as e:
             raise FetchError(EXIT_ERROR, "error", f"{type(e).__name__}: {str(e).splitlines()[0][:200]}") from e
     if assets_dir and post["images"]:
@@ -217,9 +339,10 @@ def fetch_post(url, account=None, *, assets_dir=None, lock_wait=LOCK_WAIT_SECOND
 
 
 def main(args):
-    """CLI: fetch-post URL [ACCOUNT] [--json] [--assets-dir DIR]. Returns the exit code."""
+    """CLI: fetch-post URL [ACCOUNT] [--json] [--assets-dir DIR] [--public-only]. Returns the exit code."""
     as_json = "--json" in args
-    args = [a for a in args if a != "--json"]
+    public_only = "--public-only" in args
+    args = [a for a in args if a not in ("--json", "--public-only")]
     assets_dir = None
     if "--assets-dir" in args:
         i = args.index("--assets-dir")
@@ -229,10 +352,11 @@ def main(args):
         assets_dir = args[i + 1]
         del args[i:i + 2]
     if len(args) not in (1, 2):
-        print("usage: watcher.py fetch-post URL [ACCOUNT] [--json] [--assets-dir DIR]")
+        print("usage: watcher.py fetch-post URL [ACCOUNT] [--json] [--assets-dir DIR] [--public-only]")
         return EXIT_USAGE
     try:
-        post = fetch_post(args[0], args[1] if len(args) == 2 else None, assets_dir=assets_dir)
+        post = fetch_post(args[0], args[1] if len(args) == 2 else None, assets_dir=assets_dir,
+                          public_only=public_only)
     except FetchError as e:
         if as_json:
             print(json.dumps({"schema": SCHEMA, "error": e.kind, "message": str(e)}, ensure_ascii=False))

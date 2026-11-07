@@ -168,14 +168,17 @@ def worker_error_is_raised_as_same_fbn_class():
 
 
 @case
-def real_worker_round_trip_reports_not_signed_in():
-    # The real `watcher.py scan-worker` with an empty profile: fbn says it isn't signed in.
+def real_worker_round_trip_returns_fbn_error():
+    # The real `watcher.py scan-worker` process. Its profile path is a file, so fbn refuses it
+    # before any browser starts: no Facebook.
+    bad_profile = TMP / "not-a-dir"
+    bad_profile.write_text("x")
     try:
-        w.scan_in_subprocess({"profile": TMP / "empty-profile", "proxy": None}, w.parse_group_ref("101"),
+        w.scan_in_subprocess({"profile": bad_profile, "proxy": None}, w.parse_group_ref("101"),
                              w.ScanPolicy(sample_count=1, max_scrolls=0), None)
-    except w.AuthenticationRequiredError:
+    except w.ConfigurationError:
         return
-    raise AssertionError("expected AuthenticationRequiredError from a real worker")
+    raise AssertionError("expected ConfigurationError from a real worker")
 
 
 for status, name, err in results:

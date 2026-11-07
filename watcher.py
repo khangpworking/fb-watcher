@@ -5,7 +5,8 @@ Usage (ACCOUNT defaults to the first account in config.json):
   python watcher.py import-cookies FILE [ACCOUNT]   # or: import cookies exported from a logged-in browser
   python watcher.py check-proxy [ACCOUNT]           # show the public IP the account's browser uses
   python watcher.py run                             # headless polling loop over all accounts
-  python watcher.py fetch-post URL [ACCOUNT] [--json] [--assets-dir DIR]   # read one post (README)
+  python watcher.py fetch-post URL [ACCOUNT] [--json] [--assets-dir DIR] [--public-only]   # read one post
+  python watcher.py api [--host 127.0.0.1] [--port 8091] [--docs]   # HTTP API (README "HTTP API")
   python watcher.py test-alert
   python watcher.py serve-braveduck                 # scan the groups braveduck users follow (braveduck_service)
   python watcher.py check-group LINK [ACCOUNT]      # show what serve-braveduck sees on a group's page
@@ -110,6 +111,16 @@ def open_db():
     db.execute("""CREATE TABLE IF NOT EXISTS post_cache (
         group_id TEXT, fingerprint TEXT, url TEXT NOT NULL, ts INTEGER NOT NULL,
         PRIMARY KEY (group_id, fingerprint))""")
+    # What `watcher.py api` reports at GET /status; written by the run loop each round.
+    db.execute("""CREATE TABLE IF NOT EXISTS account_status (
+        account TEXT PRIMARY KEY, state TEXT NOT NULL, reason TEXT NOT NULL, last_round INTEGER NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS group_status (
+        account TEXT, group_id TEXT, name TEXT NOT NULL, last_ok INTEGER, error TEXT NOT NULL,
+        failed_rounds INTEGER NOT NULL, failing_since TEXT NOT NULL, PRIMARY KEY (account, group_id))""")
+    # Group page visibility (public/private/unavailable), from check_group; reused for a day.
+    db.execute("""CREATE TABLE IF NOT EXISTS group_visibility (
+        group_key TEXT PRIMARY KEY, name TEXT, visibility TEXT NOT NULL, note TEXT NOT NULL,
+        numeric_id TEXT, checked_at INTEGER NOT NULL)""")
     # Deliveries still owed for matched posts: one row per post and sink, deleted once delivered.
     db.execute("""CREATE TABLE IF NOT EXISTS outbox (
         post_key TEXT, sink TEXT, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
@@ -389,26 +400,85 @@ def scan_in_process(account, group_ref, policy, boundary, headless=True, known=N
     ], complete
 
 
+class WorkerTimeout(ScanWorkerError):
+    """A worker ran past its time limit and was killed with its browser."""
+
+
+def _descendants(pid):
+    """All processes under pid, from /proc. Playwright starts Chromium in its own process
+    group, so killing the worker's group alone would leave the browser running."""
+    children = {}
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            try:
+                with open(f"/proc/{entry}/stat") as f:
+                    ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, IndexError, ValueError):
+                continue
+            children.setdefault(ppid, []).append(int(entry))
+    found, todo = [], [pid]
+    while todo:
+        for child in children.get(todo.pop(), []):
+            found.append(child)
+            todo.append(child)
+    return found
+
+
+def kill_tree(proc):
+    """Kill a worker and everything it started. Children die first, so the worker keeps the
+    profile lock until its browser is gone."""
+    tree = _descendants(proc.pid)
+    for pid in reversed(tree):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+    deadline = time.monotonic() + 5
+    while any(os.path.exists(f"/proc/{pid}") and not _zombie(pid) for pid in tree) and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+
+def _zombie(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        return True
+
+
+def call_worker(command, request, timeout, quiet=False):
+    """Run `watcher.py <command>` in its own process group with `request` as JSON on stdin;
+    return its one-line JSON reply. On timeout, kill it and every process it started.
+    quiet: drop the worker's stderr (browser and fbn logs), for callers whose logs must
+    never carry page details."""
+    worker = subprocess.Popen(
+        [sys.executable, "-u", str(ROOT / "watcher.py"), command],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, start_new_session=True,
+        stderr=subprocess.DEVNULL if quiet else None,
+    )
+    try:
+        out, _ = worker.communicate(json.dumps(request), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_tree(worker)
+        raise WorkerTimeout(f"{command} took longer than {timeout}s and was stopped") from None
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        raise ScanWorkerError(f"{command} exited with code {worker.returncode} and no result") from None
+
+
 def scan_in_subprocess(account, group_ref, policy, boundary, headless=True, known=None):
     request = {"known": known or {},
         "profile": str(account["profile"]), "proxy": account["proxy"], "group": group_ref.key,
         "sample_count": policy.sample_count, "max_scrolls": policy.max_scrolls,
         "boundary": boundary, "headless": headless,
     }
-    worker = subprocess.Popen(
-        [sys.executable, "-u", str(ROOT / "watcher.py"), "scan-worker"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, start_new_session=True,
-    )
-    try:
-        out, _ = worker.communicate(json.dumps(request), timeout=SCAN_WALL_SECONDS)
-    except subprocess.TimeoutExpired:
-        os.killpg(worker.pid, signal.SIGKILL)  # the worker and every Chromium process it started
-        worker.wait()
-        raise ScanWorkerError(f"scan took longer than {SCAN_WALL_SECONDS}s and was stopped") from None
-    try:
-        reply = json.loads(out.strip().splitlines()[-1])
-    except (IndexError, ValueError):
-        raise ScanWorkerError(f"scan worker exited with code {worker.returncode} and no result") from None
+    reply = call_worker("scan-worker", request, SCAN_WALL_SECONDS)
     if reply["ok"]:
         return reply["posts"], reply["complete"]
     error = getattr(fbn_exceptions, reply["error"], None)
@@ -567,6 +637,22 @@ def record_posts(db, posts, group_id, group_name, bootstrap, match):
     return new
 
 
+def write_status(db, accounts, down, failing):
+    """Save this round's account and group health for GET /status. Error types only."""
+    now = int(time.time())
+    with db:
+        for account in accounts:
+            reason = down.get(account["name"], "")
+            db.execute("INSERT OR REPLACE INTO account_status VALUES (?, ?, ?, ?)",
+                       (account["name"], "paused" if reason else "ok", reason, now))
+        for (account_name, gid), (name, since, rounds, err) in failing.items():
+            db.execute("""INSERT INTO group_status VALUES (?, ?, ?, NULL, ?, ?, ?)
+                ON CONFLICT (account, group_id) DO UPDATE SET
+                name = excluded.name, error = excluded.error,
+                failed_rounds = excluded.failed_rounds, failing_since = excluded.failing_since""",
+                       (account_name, gid, name, err, rounds, since))
+
+
 def cmd_run():
     cfg = load_config()
     match = build_matcher(cfg["keywords"])
@@ -609,6 +695,9 @@ def cmd_run():
                     continue
                 scanned += 1
                 failing.pop(key, None)
+                with db:
+                    db.execute("INSERT OR REPLACE INTO group_status VALUES (?, ?, ?, ?, '', 0, '')",
+                               (account["name"], gid, name, int(time.time())))
                 new = record_posts(db, posts, gid, name, bootstrap, match)
                 if bootstrap:
                     mark_group_initialized(db, gid)
@@ -622,6 +711,7 @@ def cmd_run():
                       + (f" (didn't reach last scan's newest post, {incomplete} rounds)" if incomplete else ""))
                 time.sleep(random.randint(3, 8))
 
+        write_status(db, accounts, down, failing)
         pending, failing_deliveries = deliver_pending(cfg, db)
         problems = list(down.values())
         problems += [f"{err} on {name} ({k[1]}) since {since}"
@@ -743,6 +833,12 @@ def main():
         cmd_serve_braveduck()
     elif cmd == "check-group" and len(rest) in (1, 2):
         cmd_check_group(*rest)
+    elif cmd == "api-worker" and not rest:
+        import api
+        api.cmd_api_worker()
+    elif cmd == "api":
+        import api
+        api.cmd_api(rest)
     elif cmd == "fetch-post":
         import fetch_post
         sys.exit(fetch_post.main(rest))
