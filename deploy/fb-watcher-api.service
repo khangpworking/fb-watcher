@@ -1,0 +1,15 @@
+[Unit]
+Description=fb-watcher HTTP API (fetch-post, check-group, status) on 127.0.0.1:8091
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/fb-watcher
+Environment=FB_WATCHER_API_KEY_FILE=%h/.config/fb-watcher/api.key
+# Localhost only: callers on this machine (braveduck). Never expose it publicly.
+ExecStart=%h/fb-watcher/.venv/bin/python -u watcher.py api --host 127.0.0.1 --port 8091
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
