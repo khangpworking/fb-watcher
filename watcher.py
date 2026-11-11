@@ -243,6 +243,9 @@ def report_to_braveduck(cfg, ok, reason=""):
 
 # Exit code for problems a restart can't fix (login, account check); the systemd unit doesn't restart on it.
 EXIT_NEEDS_USER = 3
+# Exit code for a browser that didn't start (a stuck worker, a busy machine): a fresh process
+# fixes it, so the unit restarts on it (a few times; then it stays down and braveduck says so).
+EXIT_RESTART = 75
 FATAL_ERRORS = (AuthenticationRequiredError, AccountActionRequiredError, BrowserUnavailableError, ConfigurationError)
 ACCOUNT_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 
@@ -808,6 +811,9 @@ def cmd_serve_braveduck():
                     print(f"[{key}] {len(fresh)} new post(s) → {res}")
                 advance_boundary(db, gid, posts, complete)
                 time.sleep(rng.randint(3, 8))
+            except BrowserUnavailableError as e:
+                print(f"[{key}] {type(e).__name__}: {e} (restarting)")
+                raise SystemExit(EXIT_RESTART)
             except FATAL_ERRORS as e:
                 send_telegram(cfg, f"⚠️ fb-watcher (braveduck scanner): account stopped ({type(e).__name__}). Log in again, then restart.")
                 raise SystemExit(EXIT_NEEDS_USER)
