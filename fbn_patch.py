@@ -13,10 +13,13 @@ silently drop a fix: re-check this file whenever you bump the fbn commit.
 6. Keep a post whose own page fbn can't render, but only if its identity still matches.
 7. Skip the timestamp tap and the post-page check for posts already handled
    (`known_links`, filled by watcher.py), so a round costs one feed load plus new posts.
+8. Keep pinned/featured cards out of scan boundaries, including an old saved boundary.
 """
 
 import logging
+import inspect
 import re
+import textwrap
 import time
 from urllib.parse import parse_qs, urlsplit
 
@@ -53,6 +56,15 @@ _SCRIPT_PATCHES = [
     (
         "records.push({card, menu, expand, regions: body.regions,",
         "records.push({card, menu, expand, timestampNode: timestamp.node, regions: body.regions,",
+        1,
+    ),
+    # Only card metadata before the message, never a mention of "pinned" in post text.
+    (
+        "author: owner, text, timestamp: clean(timestamp.node.innerText),",
+        "isPinned: sections.slice(0, start).some(section => "
+        "section.innerText.split('\\n').some(line => "
+        "/^(pinned(?: post)?|featured|announcement|đã ghim|bài viết đã ghim|đáng chú ý|thông báo)$/i.test(clean(line)))),\n"
+        "        author: owner, text, timestamp: clean(timestamp.node.innerText),",
         1,
     ),
 ]
@@ -131,7 +143,7 @@ partial_scans = []  # (reason class) of scans ended early, read by watcher.py fo
 # handled long ago. Facebook started answering post pages with empty bodies (rate
 # limiting) on 2026-11-05/06. watcher.py fills `known_links` with fingerprint -> URL of
 # posts it has already handled; for those, skip both visits. A repost with the same author
-# and opening text maps to the earlier post; its content was already delivered.
+# and opening text maps to the earlier post for at most 14 days.
 known_links = {}
 
 
@@ -216,3 +228,23 @@ def resolve_post_link(target, copied, payload, allowed_group_keys, **kwargs):
 
 
 mobile.resolve_post_link = resolve_post_link
+
+
+# fbn's Post is frozen and has no pin metadata. Keep IDs alongside this worker's
+# result and guard its early-stop check; the rest of the upstream scan stays intact.
+pinned_post_ids = set()
+_scan_views = textwrap.dedent(inspect.getsource(mobile.MobilePostSource._scan_mobile_views))
+for old, new in (
+    ('preview_signature = signature',
+     'is_pinned = payload.get("isPinned", False)\n                preview_signature = signature'),
+    ('if post.post_id == boundary_post_id:',
+     'if is_pinned:\n                    _fbw_pinned_ids.add(post.post_id)\n'
+     '                if post.post_id == boundary_post_id and not is_pinned:'),
+):
+    if _scan_views.count(old) != 1:
+        raise RuntimeError("fbn_patch: _scan_mobile_views changed upstream; update pinned-boundary patch")
+    _scan_views = _scan_views.replace(old, new)
+mobile._fbw_pinned_ids = pinned_post_ids
+_patched = {}
+exec(compile(_scan_views, "<fbn_patch:pinned-boundary>", "exec"), mobile.__dict__, _patched)
+mobile.MobilePostSource._scan_mobile_views = _patched["_scan_mobile_views"]

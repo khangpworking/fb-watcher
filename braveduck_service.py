@@ -29,6 +29,7 @@ class ScannerAPI:
         self.url = url.rstrip("/")
         self.key = key
         self.timeout = timeout
+        self._health_supported = True
 
     def _call(self, method, path, body=None):
         data = None if body is None else json.dumps(body).encode()
@@ -40,6 +41,18 @@ class ScannerAPI:
 
     def groups(self):
         return self._call("GET", "/groups") or []
+
+    def health(self, ok, error=""):
+        """Older braveduck servers have no health endpoint; probe once per process."""
+        if not self._health_supported:
+            return
+        try:
+            return self._call("POST", "/health", {"ok": ok, "error": error})
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            e.close()
+            self._health_supported = False
 
     def status(self, key, visibility, name="", note=""):
         return self._call("POST", f"/groups/{urllib.request.quote(key, safe='')}/status",
@@ -78,6 +91,7 @@ def parse_visibility(page_text, after=0):
 def parse_name(title):
     """The group's name from the page title ("Name | Facebook")."""
     name = (title or "").strip()
+    name = re.sub(r"^\(\d+\+?\)\s*", "", name)
     for suffix in (" | Facebook", "| Facebook"):
         if name.endswith(suffix):
             name = name[: -len(suffix)].strip()
@@ -133,18 +147,22 @@ def classify_group_page(final_url, title, header_text, html, key):
     return vis, "", numeric
 
 
-def load_group_page(profile_dir, proxy, key, headless=True, timeout_ms=60_000):
+def load_group_page(profile_dir, proxy, key, headless=True, timeout_ms=20_000):
     """Open a group's page with the account; return (final_url, title, header_text, html).
     Navigation off facebook.com is aborted; a login form raises AuthenticationRequiredError."""
-    from fbn.exceptions import AuthenticationRequiredError
+    from fbn.exceptions import AuthenticationRequiredError, BrowserUnavailableError
     from fbn.mobile import _trusted_url
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright, Error as PlaywrightError
+    from watcher import _LaunchOptions
 
     options = {"headless": headless}
     if proxy:
         options["proxy"] = proxy
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(str(profile_dir), **options)
+        try:
+            ctx = _LaunchOptions(p, proxy).chromium.launch_persistent_context(str(profile_dir), **options)
+        except PlaywrightError as e:
+            raise BrowserUnavailableError("The group-check browser could not be started.") from e
         try:
             ctx.route("**/*", lambda route: route.abort()
                       if route.request.is_navigation_request() and not _trusted_url(route.request.url)
@@ -161,7 +179,7 @@ def load_group_page(profile_dir, proxy, key, headless=True, timeout_ms=60_000):
             ctx.close()
 
 
-def check_group(profile_dir, proxy, url, key, headless=True, timeout_ms=60_000):
+def check_group(profile_dir, proxy, url, key, headless=True, timeout_ms=20_000):
     """Open a group's page with the scanner's account and return
     (name, visibility, note, numeric_id); visibility is 'public', 'private'
     or 'unavailable' (see classify_group_page). `url` is kept for callers; the
