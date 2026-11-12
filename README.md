@@ -76,10 +76,11 @@ When `braveduck.enabled` is true, each matching post is also added with `bravedu
 
 - This machine has no root access, so Chromium's missing system libraries (`libnss3`, `libnspr4`, `libasound2t64`) were unpacked into `libs/root` with `apt-get download` and `dpkg-deb -x`. `watcher.py` adds that folder to `LD_LIBRARY_PATH` itself.
 - Scraping breaks Facebook's ToS. Use a secondary account that has joined the groups, and keep `poll_seconds` at 60 or higher.
-- Each scan scrolls back until it reaches the newest post from the previous scan (the `boundary` table), up to `scrolls` scrolls and `sample_count` posts. The boundary only moves once a scan actually reaches it, so posts in a gap stay pending and get read in a later round. If 3 scans in a row fall short (for example, the boundary post was deleted), it moves anyway, and the board shows `incomplete scans on <group>`. Raise `sample_count` (maximum 50) for busy groups.
+- Each scan scrolls back until it reaches the newest unpinned post from the previous scan (the `boundary` table), up to `scrolls` scrolls and `sample_count` posts. Recognized pinned/featured cards are still delivered, but cannot become the boundary or stop a scan at an old boundary. The boundary only moves once a scan actually reaches it, so posts in a gap stay pending and get read in a later round. If 3 scans in a row fall short (for example, the boundary post was deleted), it moves anyway, and the board shows `incomplete scans on <group>`. Raise `sample_count` (maximum 50) for busy groups.
 - Matching posts go through an outbox in `seen.db`. A post is marked as handled in the same step as its braveduck and Telegram deliveries are queued. Every round retries whatever is still queued, including after a restart, and a delivery that has failed 3 times shows on the board as `N of M deliveries failing`.
 - Each group scan runs as a separate process (`watcher.py scan-worker`). If a scan runs past 4 minutes, that process and all of its browser processes are killed, and only that group is skipped for the round.
-- If you're logged out, Facebook asks for an account action, or the browser can't start, the watcher sends a Telegram warning and exits. Timeouts, page-layout changes and access errors only skip that group for the current round.
+- Browser launches have a 60-second timeout, scan navigation steps a 20-second timeout, and Chromium's disk cache a 50 MiB limit. Under the profile lock, stale Chromium singleton links are removed only when their owner PID is confirmed dead on this host.
+- In `run` mode, if you're logged out, Facebook asks for an account action, or the browser can't start, the watcher sends a Telegram warning and exits. `serve-braveduck` retries browser launch failures as described below. Timeouts, page-layout changes and access errors only skip that group for the current round.
 - `fbn_patch.py` patches fbn where it misses or mishandles posts (each patch is described at the top of the file):
   - a post fbn can't fully read is skipped, instead of failing the whole group;
   - posts labelled "AI content", and posts the account has already liked, are read normally;
@@ -87,6 +88,8 @@ When `braveduck.enabled` is true, each matching post is also added with `bravedu
   - if one post's link can't be read, the scan ends early and keeps the posts read so far;
   - a post whose own page fbn can't render is kept only if the page's address still names the same post.
   - posts already handled are remembered (`post_cache` in `seen.db`), so scans don't tap their timestamp or open their page again. A round costs one feed load plus a visit per new post. Before this, every round revisited every visible post, roughly 300 post pages an hour, and Facebook started returning empty post pages.
+
+  Fingerprint reuse expires after 14 days without extending the expiry on each sighting. After expiry, the link is read again and the cache can learn a repost's new URL. Reposts with the same author and opening text can still be suppressed within that window.
 
   If a patch no longer fits a new fbn version, the watcher stops at startup with a clear error.
 - Group IDs must be the numeric ID from the group's URL. Group names (slugs) are rejected, because post links are checked against the numeric ID.
@@ -136,6 +139,19 @@ reads "Public group · N members" (or "Nhóm Công khai · N thành viên"); pri
 groups and unclear ones are reported and never scanned for others, since their
 posts are for members. The same check guards the HTTP API.
 
+Serve-mode visibility checks use a locked worker process with the same four-minute
+wall as scans. A browser launch failure retries in-process after 2, 5, 10, then 20
+minutes; a fifth consecutive failure exits 75 for systemd to restart it. A successful
+scan resets that count. Authentication/account-action failures still exit 3.
+
+Every serve round writes local `/status` and sends `POST /health {"ok", "error"}`
+to braveduck. A round is OK only when at least one public group scan and its post
+handoff succeed and no group fails. Failed rounds preserve each group's last success
+and record error types and consecutive failures. The account is `unknown` on a
+transient failure or when no public group was scanned, and `paused` when user action
+is required. A 404 disables remote health reporting until the scanner restarts;
+braveduck must add the endpoint and stop treating `GET /groups` as scan success.
+
 Config: `braveduck_service` in `config.json`, or the environment (the
 Dockerfile sets these, and needs no `config.json`):
 
@@ -171,7 +187,7 @@ post = fetch_post("https://www.facebook.com/groups/<group>/posts/<post>/", accou
 - **ACCOUNT:** an account name from the config; defaults to the first account. Uses that account's profile and proxy.
 - **`--public-only`:** return the post only if its group's page says "Public group" (or "Nhóm Công khai"). Each group's visibility is checked once a day and remembered in `seen.db` (`group_visibility`).
 - **How it reads:** it opens the post on the **desktop** site. Since 2026-11-05, Facebook answers direct loads of mobile post pages with an empty page, while the desktop post page renders in full, including posts in public groups the account hasn't joined. It reads only that one post, never a feed.
-- **Sharing the profile with the watcher:** fetch-post takes the profile's lock for its whole read, about 10–20 seconds. If a scan is running it waits, for up to 4 minutes. A scan that finds fetch-post holding the lock also waits, for up to 90 seconds.
+- **Sharing the profile with the watcher:** fetch-post takes the profile's lock for its whole read, about 10–20 seconds. If a scan is running it waits, for up to 4 minutes. A scan that finds fetch-post holding the lock also waits, for up to 30 seconds.
 
 `--json` prints one object. Schema version 1:
 
@@ -232,7 +248,7 @@ A small HTTP API, so other services (for example braveduck's Go server, in anoth
 | `POST /check-group` | `{"url": "<group link or ID>", "account": null}` | `{"name", "visibility": "public" \| "private" \| "unavailable", "note", "group_id"}` |
 | `GET /status` | | `{"accounts": [{"name", "state": "ok" \| "paused" \| "unknown", "reason", "last_round"}], "groups": [{"account", "group_id", "name", "last_ok", "error", "failed_rounds", "failing_since", "incomplete_rounds"}], "deliveries": {"pending", "failing"}}` |
 
-`/status` is read from what `watcher.py run` saves each round (error types only, never post text, cookies, proxies or tokens). It shows `unknown` until the watcher has run a round on this version.
+`/status` is read from what `watcher.py run` or `serve-braveduck` saves each round (error types only, never post text, cookies, proxies or tokens). It shows `unknown` until the watcher has run a round on this version, or when a serve round cannot confirm successful scanning.
 
 Errors always come back as `{"schema": 1, "error": "<kind>", "message": "…"}`:
 
@@ -263,6 +279,7 @@ curl -s -X POST http://127.0.0.1:8091/fetch-post \
 ## Tests
 
 ```bash
+.venv/bin/python -m unittest              # service and reliability regressions
 .venv/bin/python tests/test_run_loop.py     # run loop, outbox, boundary, scan worker; no Facebook
 .venv/bin/python tests/test_fetch_post.py   # fetch-post arguments, URLs, exit codes; no Facebook
 .venv/bin/python tests/test_api.py          # HTTP API with fakes; no Facebook

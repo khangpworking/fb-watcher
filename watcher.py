@@ -243,6 +243,9 @@ def report_to_braveduck(cfg, ok, reason=""):
 
 # Exit code for problems a restart can't fix (login, account check); the systemd unit doesn't restart on it.
 EXIT_NEEDS_USER = 3
+# Exit code for a browser that didn't start (a stuck worker, a busy machine): a fresh process
+# fixes it, so the unit restarts on it (a few times; then it stays down and braveduck says so).
+EXIT_RESTART = 75
 FATAL_ERRORS = (AuthenticationRequiredError, AccountActionRequiredError, BrowserUnavailableError, ConfigurationError)
 ACCOUNT_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 
@@ -307,8 +310,38 @@ def find_account(cfg, name):
     raise SystemExit(f"No account named {name!r} in config.json (have: {', '.join(a['name'] for a in accounts)})")
 
 
-class _WithProxy:
-    """Wrap a Playwright object so fbn's persistent-context launch also gets a proxy."""
+LAUNCH_TIMEOUT_MS = 60_000
+NAVIGATION_TIMEOUT_SECONDS = 20
+DISK_CACHE_BYTES = 50 * 1024 * 1024
+
+
+def clear_stale_singleton(profile):
+    """Caller must hold the profile lock. Only reclaim a dead local owner's links."""
+    lock = Path(profile) / "SingletonLock"
+    try:
+        owner = os.readlink(lock)
+        host, _, pid = owner.rpartition("-")
+        if host != os.uname().nodename or not pid.isdecimal() or int(pid) <= 0:
+            return
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            pass
+        else:
+            return
+        if os.readlink(lock) != owner:
+            return
+        for name in ("SingletonCookie", "SingletonSocket", "SingletonLock"):
+            path = Path(profile) / name
+            if path.is_symlink():
+                path.unlink(missing_ok=True)
+    except OSError:
+        # Permission errors and unfamiliar profiles are not proof of a dead owner.
+        return
+
+
+class _LaunchOptions:
+    """Apply bounded launch/cache options through fbn's Playwright hook."""
 
     def __init__(self, playwright, proxy):
         self._playwright, self._proxy = playwright, proxy
@@ -325,7 +358,11 @@ class _WithProxy:
                 return getattr(chromium, name)
 
             def launch_persistent_context(self, user_data_dir, **options):
-                return chromium.launch_persistent_context(user_data_dir, proxy=proxy, **options)
+                options["timeout"] = LAUNCH_TIMEOUT_MS
+                options["args"] = [*options.get("args", []), f"--disk-cache-size={DISK_CACHE_BYTES}"]
+                if proxy:
+                    options["proxy"] = proxy
+                return chromium.launch_persistent_context(user_data_dir, **options)
 
         return Chromium()
 
@@ -336,8 +373,8 @@ class ProxiedSource(MobilePostSource):
         self.proxy = proxy
 
     def _launch_context(self, playwright, **kwargs):
-        if self.proxy:
-            playwright = _WithProxy(playwright, self.proxy)
+        clear_stale_singleton(kwargs["profile_dir"])
+        playwright = _LaunchOptions(playwright, self.proxy)
         return super()._launch_context(playwright, **kwargs)
 
 
@@ -359,7 +396,9 @@ def set_boundary(db, group_id, post_id):
 # children instead of freezing every other group (a stalled navigation can block fbn's
 # cleanup with no timeout of its own).
 SCAN_WALL_SECONDS = 240
-PROFILE_WAIT_SECONDS = 90
+PROFILE_WAIT_SECONDS = 30
+LAUNCH_BACKOFF_SECONDS = (120, 300, 600, 1200)
+FINGERPRINT_TTL_SECONDS = 14 * 24 * 60 * 60
 INCOMPLETE_ROUNDS_BEFORE_GAP = 3
 
 
@@ -368,8 +407,8 @@ class ScanWorkerError(FbnError):
 
 
 def known_links(db, group_id, limit=1000):
-    rows = db.execute("SELECT fingerprint, url FROM post_cache WHERE group_id = ? ORDER BY ts DESC LIMIT ?",
-                      (group_id, limit)).fetchall()
+    rows = db.execute("SELECT fingerprint, url FROM post_cache WHERE group_id = ? AND ts > ? ORDER BY ts DESC LIMIT ?",
+                      (group_id, int(time.time()) - FINGERPRINT_TTL_SECONDS, limit)).fetchall()
     return dict(rows)
 
 
@@ -381,6 +420,7 @@ def scan_in_process(account, group_ref, policy, boundary, headless=True, known=N
     fbn_patch.known_links.update(known or {})
     fbn_patch.known_urls.clear()
     fbn_patch.known_urls.update(fbn_patch.known_links.values())
+    fbn_patch.pinned_post_ids.clear()
     give_up = time.monotonic() + PROFILE_WAIT_SECONDS
     while True:
         try:
@@ -392,10 +432,11 @@ def scan_in_process(account, group_ref, policy, boundary, headless=True, known=N
                 raise
             time.sleep(3)
     posts = sorted(scan.posts, key=lambda post: post.position)
-    complete = boundary is None or any(post.post_id == boundary for post in posts)
+    complete = boundary is None or any(post.post_id == boundary and post.post_id not in fbn_patch.pinned_post_ids
+                                      for post in posts)
     return [
         {"post_id": post.post_id, "key": f"{group_ref.key}:{post.post_id}", "text": post.text,
-         "url": post.url, "author": post.author or ""}
+         "url": post.url, "author": post.author or "", "is_pinned": post.post_id in fbn_patch.pinned_post_ids}
         for post in posts
     ], complete
 
@@ -476,15 +517,50 @@ def scan_in_subprocess(account, group_ref, policy, boundary, headless=True, know
     request = {"known": known or {},
         "profile": str(account["profile"]), "proxy": account["proxy"], "group": group_ref.key,
         "sample_count": policy.sample_count, "max_scrolls": policy.max_scrolls,
+        "navigation_timeout_seconds": policy.navigation_timeout_seconds,
         "boundary": boundary, "headless": headless,
     }
     reply = call_worker("scan-worker", request, SCAN_WALL_SECONDS)
     if reply["ok"]:
         return reply["posts"], reply["complete"]
+    raise_worker_error(reply)
+
+
+def raise_worker_error(reply):
     error = getattr(fbn_exceptions, reply["error"], None)
     if not (isinstance(error, type) and issubclass(error, FbnError)):
         error = ScanWorkerError
     raise error(reply["message"])
+
+
+def check_in_subprocess(account, key, headless=True):
+    reply = call_worker("check-worker", {"profile": str(account["profile"]), "proxy": account["proxy"],
+                                        "group": key, "headless": headless}, SCAN_WALL_SECONDS)
+    if reply["ok"]:
+        return reply["result"]
+    raise_worker_error(reply)
+
+
+def cmd_check_worker():
+    import braveduck_service as bds
+    from fetch_post import _ProfileLock, FetchError
+    from playwright.sync_api import Error as PlaywrightError
+
+    request = json.loads(sys.stdin.read())
+    account = {"profile": Path(request["profile"]), "proxy": request["proxy"]}
+    try:
+        source = make_source(account, request["headless"])
+        with _ProfileLock(source, source._prepare_profile(), PROFILE_WAIT_SECONDS):
+            clear_stale_singleton(account["profile"])
+            result = bds.check_group(account["profile"], account["proxy"], "", request["group"],
+                                     request["headless"], NAVIGATION_TIMEOUT_SECONDS * 1000)
+        reply = {"ok": True, "result": result}
+    except Exception as e:
+        error = "ProfileInUseError" if isinstance(e, FetchError) and e.kind == "profile_busy" else type(e).__name__
+        if isinstance(e, PlaywrightError):
+            error = "TransientNavigationError"
+        reply = {"ok": False, "error": error, "message": error}
+    print(json.dumps(reply, ensure_ascii=False), flush=True)
 
 
 # Tests set FB_WATCHER_INPROCESS=1 to scan with fakes in the same process.
@@ -495,7 +571,8 @@ def cmd_scan_worker():
     """Internal: run one scan described on stdin; print one JSON line with the result."""
     request = json.loads(sys.stdin.read())
     account = {"profile": Path(request["profile"]), "proxy": request["proxy"]}
-    policy = ScanPolicy(sample_count=request["sample_count"], max_scrolls=request["max_scrolls"])
+    policy = ScanPolicy(sample_count=request["sample_count"], max_scrolls=request["max_scrolls"],
+                        navigation_timeout_seconds=request.get("navigation_timeout_seconds", NAVIGATION_TIMEOUT_SECONDS))
     try:
         posts, complete = scan_in_process(
             account, parse_group_ref(request["group"]), policy, request["boundary"], request["headless"],
@@ -511,15 +588,16 @@ def advance_boundary(db, group_id, posts, complete):
     gap of unread posts can't be skipped. After a few incomplete rounds in a row (the old
     boundary post was deleted, or one post keeps cutting the scan short), move anyway and
     return the gap size in rounds so the caller can report it."""
-    if not posts:
+    candidate = next((post for post in posts if not post.get("is_pinned")), None)
+    if candidate is None:
         return 0
     if complete:
         bump_incomplete(db, group_id, reset=True)
-        set_boundary(db, group_id, posts[0]["post_id"])
+        set_boundary(db, group_id, candidate["post_id"])
         return 0
     rounds = bump_incomplete(db, group_id)
     if rounds >= INCOMPLETE_ROUNDS_BEFORE_GAP:
-        set_boundary(db, group_id, posts[0]["post_id"])
+        set_boundary(db, group_id, candidate["post_id"])
     return rounds
 
 
@@ -611,8 +689,12 @@ def cache_posts(db, posts, group_id):
     """Remember every scanned post's link, so later scans don't revisit it."""
     with db:
         for post in posts:
-            db.execute("INSERT OR IGNORE INTO post_cache VALUES (?, ?, ?, ?)",
-                       (group_id, fbn_patch.fingerprint(post["author"], post["text"]), post["url"], int(time.time())))
+            now = int(time.time())
+            db.execute("""INSERT INTO post_cache VALUES (?, ?, ?, ?)
+                ON CONFLICT (group_id, fingerprint) DO UPDATE SET url=excluded.url, ts=excluded.ts
+                WHERE post_cache.ts <= ?""",
+                       (group_id, fbn_patch.fingerprint(post["author"], post["text"]), post["url"], now,
+                        now - FINGERPRINT_TTL_SECONDS))
 
 
 def record_posts(db, posts, group_id, group_name, bootstrap, match):
@@ -637,14 +719,15 @@ def record_posts(db, posts, group_id, group_name, bootstrap, match):
     return new
 
 
-def write_status(db, accounts, down, failing):
+def write_status(db, accounts, down, failing, round_error=""):
     """Save this round's account and group health for GET /status. Error types only."""
     now = int(time.time())
     with db:
         for account in accounts:
             reason = down.get(account["name"], "")
+            state = "paused" if reason else ("unknown" if round_error else "ok")
             db.execute("INSERT OR REPLACE INTO account_status VALUES (?, ?, ?, ?)",
-                       (account["name"], "paused" if reason else "ok", reason, now))
+                       (account["name"], state, reason or round_error, now))
         for (account_name, gid), (name, since, rounds, err) in failing.items():
             db.execute("""INSERT INTO group_status VALUES (?, ?, ?, NULL, ?, ?, ?)
                 ON CONFLICT (account, group_id) DO UPDATE SET
@@ -658,7 +741,8 @@ def cmd_run():
     match = build_matcher(cfg["keywords"])
     db = open_db()
     lo, hi = cfg["poll_seconds"]
-    policy = ScanPolicy(sample_count=cfg["sample_count"], max_scrolls=cfg["scrolls"])
+    policy = ScanPolicy(sample_count=cfg["sample_count"], max_scrolls=cfg["scrolls"],
+                        navigation_timeout_seconds=NAVIGATION_TIMEOUT_SECONDS)
     headless = cfg.get("headless", True)
     accounts = load_accounts(cfg)
 
@@ -745,12 +829,9 @@ def braveduck_api(cfg):
 
 
 def cmd_check_group(link, account_name=None):
-    import braveduck_service as bds
-
     account = find_account(load_config(), account_name)
     ref = parse_group_ref(link)
-    name, vis, note, numeric = bds.check_group(account["profile"], account["proxy"],
-                                               f"https://m.facebook.com/groups/{ref.key}/", ref.key)
+    name, vis, note, numeric = check_in_subprocess(account, ref.key)
     print(json.dumps({"key": ref.key, "name": name, "visibility": vis, "note": note, "numeric_id": numeric},
                      ensure_ascii=False, indent=2))
 
@@ -766,22 +847,32 @@ def cmd_serve_braveduck():
     db = open_db()
     db.execute("CREATE TABLE IF NOT EXISTS group_alias (key TEXT PRIMARY KEY, numeric_id TEXT NOT NULL)")
     lo, hi = cfg["poll_seconds"]
-    policy = ScanPolicy(sample_count=cfg["sample_count"], max_scrolls=cfg["scrolls"])
+    policy = ScanPolicy(sample_count=cfg["sample_count"], max_scrolls=cfg["scrolls"],
+                        navigation_timeout_seconds=NAVIGATION_TIMEOUT_SECONDS)
     headless = cfg.get("headless", True)
     rng = random.Random()
+    launch_failures = 0
+    failing, down = {}, {}
     while True:
+        scanned = 0
+        problems = []
+        retry_delay = None
+        exit_code = None
         try:
             groups = api.groups()
         except (OSError, ValueError) as e:
             print(f"braveduck unreachable: {type(e).__name__} (retrying)")
-            bds.sleep_between(lo, hi, rng)
-            continue
+            groups = []
+            problems.append(f"{type(e).__name__} fetching groups")
         for g in groups:
             key = g["key"]
+            status_key = (account["name"], key)
+            previous = db.execute("SELECT name FROM group_status WHERE account = ? AND group_id = ?",
+                                  status_key).fetchone()
+            name = g.get("name") or (previous[0] if previous else key)
             try:
                 if bds.due_for_check(g):
-                    name, vis, note, numeric = bds.check_group(account["profile"], account["proxy"],
-                                                               f"https://m.facebook.com/groups/{key}/", key, headless)
+                    name, vis, note, numeric = check_in_subprocess(account, key, headless)
                     if numeric:
                         db.execute("INSERT OR REPLACE INTO group_alias VALUES (?, ?)", (key, numeric))
                         db.commit()
@@ -790,14 +881,18 @@ def cmd_serve_braveduck():
                     print(f"[{key}] {vis} {name!r} {note}")
                     time.sleep(rng.randint(3, 8))
                 if g["visibility"] != "public":
+                    if g["visibility"] != "private":
+                        raise ScanWorkerError("Group visibility unavailable")
+                    failing.pop(status_key, None)
                     continue
                 row = db.execute("SELECT numeric_id FROM group_alias WHERE key = ?", (key,)).fetchone()
                 numeric = key if key.isdecimal() else (row[0] if row else None)
                 if not numeric:
-                    continue  # checked next round
+                    raise ScanWorkerError("Group numeric ID unavailable")
                 gid = numeric
                 posts, complete = run_scan(account, parse_group_ref(gid), policy, get_boundary(db, gid), headless,
                                            known_links(db, gid))
+                launch_failures = 0
                 cache_posts(db, posts, gid)
                 fresh = bds.new_posts(posts, lambda k: is_seen(db, k))
                 if fresh:
@@ -807,13 +902,45 @@ def cmd_serve_braveduck():
                             mark_seen(db, p["key"], gid)
                     print(f"[{key}] {len(fresh)} new post(s) → {res}")
                 advance_boundary(db, gid, posts, complete)
+                scanned += 1
+                failing.pop(status_key, None)
+                with db:
+                    db.execute("INSERT OR REPLACE INTO group_status VALUES (?, ?, ?, ?, '', 0, '')",
+                               (account["name"], key, name, int(time.time())))
                 time.sleep(rng.randint(3, 8))
-            except FATAL_ERRORS as e:
-                send_telegram(cfg, f"⚠️ fb-watcher (braveduck scanner): account stopped ({type(e).__name__}). Log in again, then restart.")
-                raise SystemExit(EXIT_NEEDS_USER)
             except (FbnError, OSError, ValueError) as e:
-                print(f"[{key}] {type(e).__name__}: {e} (next round)")
-        bds.sleep_between(lo, hi, rng)
+                err = type(e).__name__
+                _, since, rounds, _ = failing.get(status_key, (name, time.strftime("%H:%M"), 0, ""))
+                failing[status_key] = (name, since, rounds + 1, err)
+                problems.append(f"{err} on {key}")
+                print(f"[{key}] {err} (round failed)")
+                if isinstance(e, BrowserUnavailableError):
+                    launch_failures += 1
+                    if launch_failures > len(LAUNCH_BACKOFF_SECONDS):
+                        exit_code = EXIT_RESTART
+                    else:
+                        retry_delay = LAUNCH_BACKOFF_SECONDS[launch_failures - 1]
+                        print(f"Browser launch failure {launch_failures}; retrying in {retry_delay}s")
+                    break
+                if isinstance(e, FATAL_ERRORS):
+                    down[account["name"]] = f"{err} on account {account['name']}"
+                    exit_code = EXIT_NEEDS_USER
+                    break
+        ok = scanned > 0 and not problems
+        reason = "; ".join(problems) or ("" if scanned else "No public groups scanned")
+        write_status(db, [account], down, failing, round_error=reason)
+        try:
+            api.health(ok, reason)
+        except (OSError, ValueError) as e:
+            print(f"braveduck health report failed: {type(e).__name__}")
+        if exit_code is not None:
+            if exit_code == EXIT_NEEDS_USER:
+                send_telegram(cfg, "⚠️ fb-watcher (braveduck scanner): " + reason + ". Account needs attention, then restart.")
+            raise SystemExit(exit_code)
+        if retry_delay is not None:
+            time.sleep(retry_delay)
+        else:
+            bds.sleep_between(lo, hi, rng)
 
 
 def main():
@@ -829,6 +956,8 @@ def main():
         cmd_run()
     elif cmd == "scan-worker" and not rest:
         cmd_scan_worker()
+    elif cmd == "check-worker" and not rest:
+        cmd_check_worker()
     elif cmd == "serve-braveduck" and not rest:
         cmd_serve_braveduck()
     elif cmd == "check-group" and len(rest) in (1, 2):

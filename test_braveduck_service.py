@@ -26,6 +26,9 @@ class Visibility(unittest.TestCase):
 
     def test_name_and_id(self):
         self.assertEqual(bds.parse_name("Tuyển Dụng AI Engineer Việt Nam | Facebook"), "Tuyển Dụng AI Engineer Việt Nam")
+        for title, name in [("(2) Jobs | Facebook", "Jobs"), ("(99+) Việc làm| Facebook", "Việc làm"),
+                            ("(2026)Jobs | Facebook", "Jobs"), ("(Remote) Jobs | Facebook", "(Remote) Jobs")]:
+            self.assertEqual(bds.parse_name(title), name)
         self.assertEqual(bds.parse_group_id("", "3989249071208661"), "3989249071208661")
         self.assertEqual(bds.parse_group_id('<meta content="fb://group/?id=1234567890">', "ai.jobs"), "1234567890")
         self.assertEqual(bds.parse_group_id('{"groupID":"98765432101"}', "ai.jobs"), "98765432101")
