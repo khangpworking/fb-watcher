@@ -98,7 +98,9 @@ When `braveduck.enabled` is true, each matching post is also added with `bravedu
 
 ## Run as a service
 
-`deploy/fb-watcher.service` is a systemd user service. It runs `watcher.py run`, restarts 60 seconds after a crash, and stays stopped after exit code 3 (logged out or account check required, which needs you).
+`deploy/fb-watcher.service` is a systemd user service. It runs `watcher.py run`. It restarts 2 minutes after a crash or a browser that didn't start (exit 75), at most 5 times in 30 minutes, and stays stopped after exit code 3 (logged out or account check required, which needs you). It runs at low priority with memory capped at 1.5 GB, so a busy machine stays usable.
+
+To run it as braveduck's scanner (`serve-braveduck`) instead, add the drop-in `deploy/braveduck-scanner.conf.example`; its comments say how.
 
 ```bash
 ln -sf ~/fb-watcher/deploy/fb-watcher.service ~/.config/systemd/user/fb-watcher.service

@@ -1,0 +1,13 @@
+# Drop-in: run fb-watcher as braveduck's Facebook scanner (serve-braveduck)
+# instead of the config.json groups (run). Install:
+#   mkdir -p ~/.config/systemd/user/fb-watcher.service.d
+#   ln -sf ~/fb-watcher/deploy/braveduck-scanner.conf.example \
+#     ~/.config/systemd/user/fb-watcher.service.d/braveduck.conf
+#   systemctl --user daemon-reload && systemctl --user restart fb-watcher
+# braveduck must run with --scanner-addr 127.0.0.1:8092 --scanner-key-file
+# (the same key file as below). Keep that port on loopback, never public.
+[Service]
+Environment=BRAVEDUCK_SCANNER_URL=http://127.0.0.1:8092
+Environment=BRAVEDUCK_SCANNER_KEY_FILE=%h/.config/braveduck/scanner.key
+ExecStart=
+ExecStart=%h/fb-watcher/.venv/bin/python -u watcher.py serve-braveduck
