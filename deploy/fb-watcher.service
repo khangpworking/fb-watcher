@@ -1,15 +1,26 @@
 [Unit]
 Description=fb-watcher: Facebook group keyword alerts -> Telegram + braveduck
 After=network-online.target
+# At most 5 restarts in 30 minutes; after that it stays down (and braveduck,
+# when it's the scanner, warns that Facebook went quiet).
+StartLimitIntervalSec=1800
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=%h/fb-watcher
 ExecStart=%h/fb-watcher/.venv/bin/python -u watcher.py run
+# Exit 75 = the browser didn't start (a busy machine): a fresh process fixes
+# it, so restart after 2 minutes. Exit 3 = logged out / account check: needs
+# you, so don't restart into it.
 Restart=on-failure
-RestartSec=60
-# Exit 3 = logged out / account check: needs you, so don't restart into it.
+RestartSec=120
 RestartPreventExitStatus=3
+# Keep the machine responsive: Chromium can take over 1 GB.
+MemoryHigh=1G
+MemoryMax=1536M
+Nice=10
+CPUWeight=50
 
 [Install]
 WantedBy=default.target
